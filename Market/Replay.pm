@@ -51,6 +51,10 @@ sub new {
         _fast     => 0,
         _ts       => undef,
         _after_id => undef,   # id del after pendiente (para poder cancelarlo)
+        # OPTIMIZACION: callback que devuelve el subconjunto de indicadores a
+        # (re)construir/avanzar = solo los de overlays activos + dependencias.
+        # Si es undef, se procesan TODOS (comportamiento original).
+        _needed   => $args{needed_indicators},
     };
     bless $self, $class;
     return $self;
@@ -82,6 +86,7 @@ sub start {
     $self->{_fast}    = 0;
 
     $self->{market}->set_replay_boundary($ts);
+    $self->_init_session;   # subconjunto de indicadores a procesar en esta sesion
     $self->_full_rebuild;
     $self->{_ts} = $self->{market}->get_replay_boundary;
 
@@ -109,10 +114,14 @@ sub step_forward {
     my $target = $cur_idx + $n;
     $target = $raw_last if $target > $raw_last;
 
+    my $need = $self->_needed_names;   # mismo subconjunto que en el rebuild
     for my $idx ( ($cur_idx + 1) .. $target ) {
         my $c = $market->raw_get_candle($idx);
         $market->set_replay_boundary($c->{ts});
-        $self->{indicators}->update_last($market) if $self->{indicators};
+        if ( $self->{indicators} ) {
+            if ($need) { $self->{indicators}->update_last_subset($market, $need); }
+            else       { $self->{indicators}->update_last($market); }
+        }
     }
 
     $self->{_ts} = $market->get_replay_boundary;
@@ -265,8 +274,47 @@ sub exit_replay {
 sub _full_rebuild {
     my ($self) = @_;
     return unless $self->{indicators};
-    $self->{indicators}->reset_all;
-    $self->{indicators}->rebuild_all($self->{market});
+    my $need = $self->_needed_names;
+    if ($need) {
+        # Solo los indicadores necesarios (overlays activos + dependencias).
+        $self->{indicators}->rebuild_subset($self->{market}, $need);
+    } else {
+        $self->{indicators}->reset_all;
+        $self->{indicators}->rebuild_all($self->{market});
+    }
+}
+
+# Subconjunto de indicadores a procesar durante el replay = SOLO los de overlays
+# activos + dependencias (callback provisto por la UI). Para no dejar indicadores
+# obsoletos al salir, el conjunto de la SESION solo CRECE: si un overlay se activa
+# a mitad del replay, su indicador se agrega y se reconstruye; si luego se apaga,
+# permanece en el conjunto (se sigue avanzando) para que al salir todos queden al
+# dia (0..N). Los que NUNCA se activaron no se tocan (siguen en 0..N del arranque).
+sub set_needed_indicators { $_[0]->{_needed} = $_[1]; }
+sub _init_session {
+    my ($self) = @_;
+    if ($self->{_needed}) {
+        my $n = $self->{_needed}->();
+        $self->{_session} = (ref $n eq 'ARRAY' && @$n) ? { map { $_ => 1 } @$n } : undef;
+    } else {
+        $self->{_session} = undef;   # sin callback -> todos (comportamiento original)
+    }
+}
+sub _needed_names {
+    my ($self) = @_;
+    return undef unless $self->{_session};
+    return [ keys %{ $self->{_session} } ];
+}
+# rebuild_needed: al cambiar la visibilidad de overlays durante el replay, UNE el
+# nuevo subconjunto al de la sesion y reconstruye hasta la frontera actual.
+sub rebuild_needed {
+    my ($self) = @_;
+    return unless $self->{_active} && $self->{indicators} && $self->{_needed};
+    my $n = $self->{_needed}->();
+    return unless ref $n eq 'ARRAY' && @$n;
+    $self->{_session} ||= {};
+    $self->{_session}{$_} = 1 for @$n;                       # el conjunto solo crece
+    $self->{indicators}->rebuild_subset($self->{market}, [ keys %{ $self->{_session} } ]);
 }
 
 sub _notify {

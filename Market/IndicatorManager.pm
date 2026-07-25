@@ -125,4 +125,34 @@ sub rebuild_one {
     }
 }
 
+# -----------------------------------------------------------------------------
+# rebuild_subset / update_last_subset  (optimizacion de Replay)
+# Reconstruyen / avanzan SOLO los indicadores nombrados (en orden de registro),
+# respetando la frontera de replay (size = last_index+1). Sirve para no recalcular
+# indicadores cuyo overlay esta apagado (ni sus dependencias) al arrancar el
+# replay. El resultado de un indicador incluido es IDENTICO al rebuild completo
+# (mismo dato, misma frontera); solo se omite el trabajo de los NO incluidos.
+# -----------------------------------------------------------------------------
+sub rebuild_subset {
+    my ($self, $market_data, $names) = @_;
+    my %want = map { $_ => 1 } @$names;
+    my @inds = grep { $_ && $_->can('update_at_index') }
+               map  { $want{$_} ? $self->{indicators}{$_} : () } @{ $self->{_order} };
+    return unless @inds;
+    $_->reset for grep { $_->can('reset') } @inds;
+    my $size = $market_data->size;
+    for my $i (0 .. $size - 1) {
+        $_->update_at_index($market_data, $i) for @inds;
+    }
+}
+
+sub update_last_subset {
+    my ($self, $market_data, $names) = @_;
+    my %want = map { $_ => 1 } @$names;
+    for my $name (@{ $self->{_order} }) {
+        next unless $want{$name} && $self->{indicators}{$name};
+        $self->{indicators}{$name}->update_last($market_data);
+    }
+}
+
 1;

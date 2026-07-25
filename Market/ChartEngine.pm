@@ -145,6 +145,19 @@ sub cancel_candle_pick {
 sub is_picking { return $_[0]->{_pick_mode} ? 1 : 0; }
 
 # -----------------------------------------------------------------------------
+# set_vwap_anchor_hooks (Anchored VWAP manual)
+# Registra dos closures para poder ARRASTRAR el marcador del ancla manual:
+#   $get -> devuelve el indice logico de la vela del ancla (o undef si no hay).
+#   $set -> recibe un indice de vela y reubica el ancla (y dispara render).
+# Es generico: ChartEngine no conoce el indicador; solo mueve el ancla via hooks.
+# -----------------------------------------------------------------------------
+sub set_vwap_anchor_hooks {
+    my ($self, $get, $set) = @_;
+    $self->{_vwap_anchor_get} = $get;
+    $self->{_vwap_anchor_set} = $set;
+}
+
+# -----------------------------------------------------------------------------
 # set_replay_start_marker / clear_replay_start_marker
 # Marca en el grafico la vela desde la que arranco el Replay: una linea
 # vertical + un label con su fecha/hora. Sirve como confirmacion visual de que
@@ -680,6 +693,20 @@ sub bind_events {
 
         return unless defined $panel;
 
+        # --- Arrastre del MARCADOR del Anchored VWAP manual (prioridad sobre el
+        #     paneo): si el clic cae cerca del marcador del ancla, se entra en
+        #     modo arrastre del ancla en vez de mover el grafico. ---
+        if ( $panel eq 'price' && $self->{_vwap_anchor_get} && $self->{_scale_price} ) {
+            my $ai = $self->{_vwap_anchor_get}->();
+            if ( defined $ai ) {
+                my $ax = $self->{_scale_price}->index_to_center_x($ai);
+                if ( abs( $lx - $ax ) <= 8 ) {
+                    $self->{_dragging_vwap} = 1;
+                    return;   # no inicia el paneo
+                }
+            }
+        }
+
         # --- Drag en regleta Y de precios: activa modo manual precio ---
         if ( $panel eq 'price_scale' ) {
             unless ( $self->{y_range_price} ) {
@@ -757,6 +784,19 @@ sub bind_events {
     # =========================================================================
     $toplevel->bind( '<B1-Motion>', sub {
         my $ev = $_[0]->XEvent;
+
+        # --- Arrastre del ANCLA del VWAP manual: reubica el ancla en la vela
+        #     bajo el cursor y recalcula (el hook dispara request_render). ---
+        if ( $self->{_dragging_vwap} ) {
+            my ( $vp2, $vlx ) = $hit_test->( $ev->X, $ev->Y );
+            if ( defined $vp2 && $vp2 eq 'price' && $self->{_scale_price}
+                 && $self->{_vwap_anchor_set} ) {
+                my $vidx = $self->{_scale_price}->x_to_index($vlx);
+                $self->{_vwap_anchor_set}->($vidx)
+                    if defined $vidx && $self->{market}->get_candle($vidx);
+            }
+            return;
+        }
 
         # --- Drag activo en regleta Y ---
         if ( defined $self->{_scale_drag_panel} ) {
@@ -879,6 +919,7 @@ sub bind_events {
     # BUTTONRELEASE-1
     # =========================================================================
     $toplevel->bind( '<ButtonRelease-1>', sub {
+        if ( $self->{_dragging_vwap} ) { $self->{_dragging_vwap} = 0; return; }
         if ( defined $self->{_scale_drag_panel} ) {
             $self->{_scale_drag_panel}    = undef;
             $self->{_scale_drag_start_y}  = undef;
