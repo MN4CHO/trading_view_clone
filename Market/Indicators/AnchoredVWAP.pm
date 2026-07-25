@@ -1,29 +1,32 @@
 package Market::Indicators::AnchoredVWAP;
 
 # =============================================================================
-# Market::Indicators::AnchoredVWAP   (2a fase -- Anchored VWAP multipivote)
+# Market::Indicators::AnchoredVWAP   (2a fase -- Anchored VWAP unico re-anclable)
 #
-# VWAP anclado con MULTIPLES anclas simultaneas (acumulados independientes, sin
-# mezclar). Incremental, sobre TODA la data desde cada ancla hasta el cutoff
-# (respeta Replay via MarketData). NO depende del Canvas. NO reimplementa BOS/
-# CHoCH ni el Volume Profile: CONSUME sus salidas confirmadas.
+# UN solo VWAP anclado. El usuario ANCLA con un clic (_manual_ts) y el VWAP y
+# sus bandas nacen SIEMPRE en esa vela ("el ancla solo se mueve si yo lo
+# muevo"): la vela del ancla NO cambia con la FUENTE (_manual_source). La fuente
+# solo define el PRECIO BASE dentro de la vela anclada ('open'=APERTURA;
+# session/BOS/CHoCH/POC=HLC3), que reposiciona el rombo en la vela y el primer
+# valor del VWAP (nacen juntos). Incremental, respeta Replay via MarketData.
+# NO depende del Canvas. NO reimplementa BOS/CHoCH ni el Volume Profile:
+# CONSUME sus salidas (eventos registrados; no mueven el ancla manual).
 #
-# FORMULA (documentada): src=hlc3 (configurable close/hl2/hlc3/ohlc4);
-#   cum_pv += src*volume ; cum_v += volume ; vwap = cum_pv/cum_v.
-#   volumen 0 => suma 0 (no altera); cum_v==0 => value=undef (no fabrica).
-#   Reinicio EXACTO en la vela del ancla (para POC, desde la vela de control del
-#   perfil, acumulando hacia adelante). Sin redondeo intermedio.
+# FORMULA (la aplica vwap_line desde el ancla efectiva): el precio base depende
+#   de la FUENTE del ancla ('open'=apertura de la vela; session/BOS/CHoCH/POC=
+#   HLC3); el primer valor del VWAP en la vela ancla ES el punto del rombo.
+#   cum_pv += src*volume ; cum_v += volume ; vwap = cum_pv/cum_v. volumen 0 =>
+#   suma 0; cum_v==0 => value=undef. Bandas: stdev ponderada por volumen =
+#   sqrt(max(0, cum_pv2/cum_v - vwap^2)).
 #
-# ANCLAS (5 tipos): 'session' (apertura ETH = bucket de sesion del MarketData),
-#   'open' (apertura oficial, minuto local configurable, distinta del inicio
-#   ETH), 'BOS' y 'CHoCH' (eventos CONFIRMADOS de SMC, ancla en la vela de
-#   confirmacion), 'POC' (vela de control del ultimo perfil CERRADO del Volume
-#   Profile validado). Una activa por tipo (la anterior del mismo tipo pasa a
-#   inactive, congelada). Sin duplicar (cursores/flags). reset() limpia todo
-#   (cambio de simbolo/TF). Sin futuro (solo eventos con ts <= vela actual).
-#
-# Cada ancla conserva: id, type, ts, tf, anchor_price, cum_pv, cum_v, value,
-# state (active|inactive), origin, start_idx, end_ts.
+# EVENTOS (5 tipos) detectados en update_at_index y guardados en
+#   _events{tipo}=[{idx,ts},...] (respetan el cutoff, sin futuro): 'session'
+#   (apertura ETH = cambio de bucket de sesion), 'open' (apertura oficial RTH,
+#   cruce del minuto local), 'BOS'/'CHoCH' (eventos CONFIRMADOS de SMC), 'POC'
+#   (vela de control de cada perfil CERRADO del Volume Profile). NO mueven el
+#   ancla manual (quedan disponibles para funciones futuras). reset() limpia
+#   _events (se re-registran en el rebuild); _manual_ts y _manual_source
+#   PERSISTEN (solo cambian por accion del usuario).
 # =============================================================================
 
 use strict;
@@ -32,18 +35,21 @@ use warnings;
 sub new {
     my ($class, %a) = @_;
     my $self = {
-        src              => $a{src}              // 'hlc3',
+        # Fuente de PRECIO del VWAP SEGUN la fuente del ancla (define la posicion
+        # del rombo Y el nacimiento de las lineas): 'open' (Apertura de mercado)
+        # usa la APERTURA de la vela; el resto (Inicio de Sesion/BOS/CHoCH/POC)
+        # usa HLC3. El primer valor del VWAP en la vela ancla ES el punto del
+        # rombo, asi las lineas nacen de el. Se puede forzar una fuente unica
+        # pasando src => open|close|hl2|hlc3|ohlc4.
+        src              => $a{src},   # undef => segun la fuente del ancla
         session_tf       => $a{session_tf}       // 'D',
         official_open_min=> $a{official_open_min}// 510,   # 08:30 local (-05:00) = RTH / cash open
         local_offset_sec => $a{local_offset_sec} // -5*3600,
         anchor_scope     => exists $a{anchor_scope} ? $a{anchor_scope} : 'external',
-        max_inactive     => $a{max_inactive}     // 24,
         smc              => $a{smc},
         vp               => $a{vp},
 
         _c            => [],
-        _anchors      => [],
-        _next_id      => 1,
         _tf           => undef,
         _cur_skey     => undef,
         _seen_open    => 0,
@@ -51,26 +57,53 @@ sub new {
         _smc_seen     => 0,
         _vp_seen      => 0,
         _market_data  => undef,
-        _manual_ts    => undef,   # ts del ancla MANUAL (clic del usuario); persiste
+        _manual_ts     => undef,   # ts del ANCLA manual (clic del usuario); persiste
+        # Fuente del ancla. 'session' (default) = anclar EXACTO en la vela clicada;
+        # open/BOS/CHoCH/POC = reanclar al evento de ese tipo mas cercano al clic.
+        _manual_source => $a{manual_source} // 'session',   # session|open|BOS|CHoCH|POC
+        # Eventos detectados por tipo, para poder REANCLAR sin recalcular:
+        #   { session=>[{idx,ts},...], open=>[...], BOS=>[...], CHoCH=>[...], POC=>[...] }
+        _events        => {},
         # multiplicadores de banda (desv. estandar ponderada), igual que el Pine.
-        band_mults    => $a{band_mults} // [ 1.0, 2.0, 3.0 ],
+        band_mults     => $a{band_mults} // [ 1.0, 2.0, 3.0 ],
     };
     bless $self, $class;
     return $self;
 }
 
 sub get_values      { return []; }
-sub get_anchors     { return $_[0]->{_anchors}; }
-sub get_active      { return [ grep { $_->{state} eq 'active' } @{ $_[0]->{_anchors} } ]; }
 sub get_market_data { return $_[0]->{_market_data}; }
 
 sub reset {
     my ($self) = @_;
-    $self->{_c} = []; $self->{_anchors} = []; $self->{_next_id} = 1;
+    $self->{_c} = [];
     $self->{_tf} = undef; $self->{_cur_skey} = undef; $self->{_seen_open} = 0;
     $self->{_prev_lmin} = undef;
     $self->{_smc_seen} = 0; $self->{_vp_seen} = 0; $self->{_market_data} = undef;
+    $self->{_events} = {};   # se re-registran en el rebuild (respetan el cutoff)
+    $self->{_ma_cache} = undef; $self->{_ma_cache_key} = undef;
+    # OJO: _manual_ts y _manual_source PERSISTEN (el ancla del usuario y su fuente
+    # sobreviven a rebuild/replay; solo cambian por accion explicita del usuario).
 }
+
+# _record_event: guarda cada evento detectado (idx de vela + ts) por tipo, en
+# orden ascendente de ts. Sirve para REANCLAR el VWAP unico a la fuente elegida
+# sin recalcular nada. Respeta el cutoff (solo se registran eventos ya vistos).
+sub _record_event {
+    my ($self, $type, $idx, $ts) = @_;
+    push @{ $self->{_events}{$type} }, { idx => $idx, ts => $ts };
+}
+
+# Fuente/tipo de ancla del VWAP unico (session|open|BOS|CHoCH|POC). Al cambiarla,
+# el VWAP se reancla al evento de ese tipo mas cercano al clic (get_manual_anchor).
+sub set_manual_source {
+    my ($self, $type) = @_;
+    return unless defined $type && $type ne '';
+    $self->{_manual_source} = $type;
+    $self->{_ma_cache} = undef; $self->{_ma_cache_key} = undef;
+    return;
+}
+sub get_manual_source { return $_[0]->{_manual_source}; }
 
 sub update_last {
     my ($self, $md) = @_;
@@ -89,13 +122,19 @@ sub _stdev {
     return sqrt($var);
 }
 
+# Precio base por FUENTE del ancla: 'Apertura de mercado' = apertura de la vela;
+# el resto (Inicio de Sesion / BOS / CHoCH / POC) = HLC3 (estandar del VWAP).
+my %SRC_OF_SOURCE = ( session=>'hlc3', open=>'open', BOS=>'hlc3', CHoCH=>'hlc3', POC=>'hlc3' );
+
 sub _src {
     my ($self, $c) = @_;
-    my $s = $self->{src};
+    my $s = $self->{src}
+         // $SRC_OF_SOURCE{ $self->{_manual_source} // 'session' } // 'hlc3';
+    return $c->{open}                                           if $s eq 'open';
     return $c->{close}                                          if $s eq 'close';
     return ($c->{high}+$c->{low})/2                             if $s eq 'hl2';
     return ($c->{open}+$c->{high}+$c->{low}+$c->{close})/4      if $s eq 'ohlc4';
-    return ($c->{high}+$c->{low}+$c->{close})/3;                # hlc3 (default)
+    return ($c->{high}+$c->{low}+$c->{close})/3;                # hlc3
 }
 
 sub _local_min {
@@ -118,29 +157,18 @@ sub update_at_index {
     $self->{_tf} = $md->get_timeframe;
     push @{ $self->{_c} }, $c;
 
-    my $src = $self->_src($c);
-    my $vol = $c->{volume} // 0;
-    my $lm  = $self->_local_min($c->{ts});
+    my $lm = $self->_local_min($c->{ts});
 
-    # (1) acumular la vela actual en las anclas YA activas (creadas antes de i).
-    for my $a (@{ $self->{_anchors} }) {
-        next unless $a->{state} eq 'active';
-        $a->{cum_pv}  += $src * $vol;         # volumen 0 => suma 0
-        $a->{cum_pv2} += $src * $src * $vol;  # para la desviacion estandar (bandas)
-        $a->{cum_v}   += $vol;
-        $a->{value}    = $a->{cum_v} > 0 ? $a->{cum_pv} / $a->{cum_v} : undef;
-        $a->{stdev}    = _stdev( $a->{cum_pv}, $a->{cum_pv2}, $a->{cum_v} );
-        $a->{end_ts}   = $c->{ts};
-        $a->{end_idx}  = $i;            # ultima vela acumulada (congela al pasar a inactive)
-    }
-
-    # (2) crear anclas nuevas para esta vela (init con la vela i; sin doble conteo).
-    #   -- inicio de sesion (apertura ETH)
+    # DETECTAR y REGISTRAR los eventos de cada tipo (sin futuro, respetando el
+    # cutoff). Ya NO se crean anclas VWAP por tipo: hay UN solo VWAP re-anclable
+    # (get_manual_anchor) que usa estos eventos para reanclarse a la fuente
+    # elegida. La formula VWAP la aplica vwap_line desde el ancla efectiva.
+    #   -- inicio de sesion (apertura ETH = cambio de bucket de sesion)
     my $skey = $self->_session_key($md, $c->{ts});
     if (!defined $self->{_cur_skey} || $self->{_cur_skey} != $skey) {
         $self->{_cur_skey} = $skey;
         $self->{_seen_open} = 0;   # nueva sesion: re-armar deteccion de apertura oficial
-        $self->_new_anchor('session', $i, $src*$vol, $src*$src*$vol, $vol, $c->{ts}, $src, { session_key => $skey });
+        $self->_record_event('session', $i, $c->{ts});
     }
     #   -- apertura oficial del mercado (distinta del inicio ETH): CRUCE hacia
     #      arriba del minuto de apertura (509->510), no un simple ">=". Asi no se
@@ -149,8 +177,7 @@ sub update_at_index {
         && $self->{_prev_lmin} < $self->{official_open_min}
         && $lm >= $self->{official_open_min}) {
         $self->{_seen_open} = 1;
-        $self->_new_anchor('open', $i, $src*$vol, $src*$src*$vol, $vol, $c->{ts}, $src,
-                           { open_min => $self->{official_open_min} });
+        $self->_record_event('open', $i, $c->{ts});
     }
     #   -- BOS / CHoCH confirmados (cursor sobre eventos de SMC; e->ts == ts de i)
     if ($self->{smc}) {
@@ -161,12 +188,11 @@ sub update_at_index {
             $self->{_smc_seen}++;
             next if defined $self->{anchor_scope} && ($e->{scope}//'') ne $self->{anchor_scope};
             next unless $e->{type} eq 'BOS' || $e->{type} eq 'CHoCH';
-            $self->_new_anchor($e->{type}, $i, $src*$vol, $src*$src*$vol, $vol, $c->{ts}, $src,
-                               { event_ts => $e->{ts}, dir => $e->{dir}, scope => $e->{scope} });
+            $self->_record_event($e->{type}, $i, $c->{ts});
         }
     }
-    #   -- POC confirmado: al cerrar un perfil del Volume Profile, anclar en su
-    #      vela de control (mayor volumen del perfil), acumulando hacia adelante.
+    #   -- POC confirmado: al cerrar un perfil del Volume Profile, evento en su
+    #      vela de control (mayor volumen del perfil).
     if ($self->{vp}) {
         my $profs = $self->{vp}->{_profiles};   # perfiles CERRADOS (confirmados)
         while ($self->{_vp_seen} < scalar(@$profs)) {
@@ -175,15 +201,7 @@ sub update_at_index {
             next if $p->{incomplete} || !$p->{_idxs} || !@{ $p->{_idxs} };
             my $pi = $self->_poc_control_index($p);
             next unless defined $pi && $pi <= $i;
-            my ($pv, $pv2, $v) = (0, 0, 0);
-            for my $j ($pi .. $i) {
-                my $cj = $self->{_c}[$j]; next unless $cj;
-                my $vv = $cj->{volume} // 0;
-                my $sj = $self->_src($cj);
-                $pv += $sj * $vv; $pv2 += $sj * $sj * $vv; $v += $vv;
-            }
-            $self->_new_anchor('POC', $pi, $pv, $pv2, $v, $self->{_c}[$pi]{ts}, $self->_src($self->{_c}[$pi]),
-                               { profile_id => $p->{id}, poc_price => $p->{poc_price} });
+            $self->_record_event('POC', $pi, $self->{_c}[$pi]{ts});
         }
     }
 
@@ -244,14 +262,28 @@ sub vwap_line {
 # =============================================================================
 sub set_manual_anchor {
     my ($self, $ts) = @_;
-    $self->{_manual_ts} = $ts;   # el overlay/engine dispara el re-render
-    return $self->get_manual_anchor;
+    $self->{_manual_ts} = $ts;   # O(1): SOLO guarda el ts. El ancla se computa
+    return;                      # bajo demanda en get_manual_anchor (1 vez por
+                                 # render). Antes devolvia get_manual_anchor (O(N)
+                                 # = recorre todas las velas) en CADA llamada, y al
+                                 # arrastrar el marcador se llama por cada evento de
+                                 # B1-Motion -> saturaba el hilo de Tk y el grafico
+                                 # se congelaba ("las velas se escondian").
 }
-sub clear_manual_anchor { $_[0]->{_manual_ts} = undef; return; }
+sub clear_manual_anchor { $_[0]->{_manual_ts} = undef; $_[0]->{_ma_cache} = undef; $_[0]->{_ma_cache_key} = undef; return; }
 sub has_manual_anchor   { return defined $_[0]->{_manual_ts} ? 1 : 0; }
 
-# get_manual_anchor: ancla manual resuelta contra las velas ACTUALES (hasta el
-# cutoff de Replay). Devuelve un objeto ancla compatible con vwap_line, o undef.
+# get_manual_anchor: ancla EFECTIVA del VWAP unico, resuelta contra las velas
+# ACTUALES (hasta el cutoff de Replay). Devuelve un objeto compatible con
+# vwap_line, o undef.
+#
+# El clic del usuario fija una REFERENCIA (_manual_ts). La FUENTE (_manual_source:
+# session|open|BOS|CHoCH|POC) decide en que EVENTO de ese tipo se ancla realmente
+# el VWAP: el MAS CERCANO a la referencia (antes o despues). Si no hay eventos de
+# ese tipo, cae al propio clic.
+#
+# CACHE: se recomputa solo si cambia la referencia, la fuente o el nº de velas
+# (Replay/nuevas). Asi un render que no cambia nada es O(1).
 sub get_manual_anchor {
     my ($self) = @_;
     my $ts = $self->{_manual_ts};
@@ -259,51 +291,55 @@ sub get_manual_anchor {
     my $c = $self->{_c};
     my $n = scalar @$c;
     return undef unless $n;
-    # vela ancla = primera con ts >= _manual_ts (dentro del cutoff actual)
-    my $ai;
-    for my $j (0 .. $n-1) { if ($c->[$j]{ts} >= $ts) { $ai = $j; last; } }
-    return undef unless defined $ai;
-    my ($pv, $pv2, $v) = (0, 0, 0);
-    for my $j ($ai .. $n-1) {
-        my $vv = $c->[$j]{volume} // 0; my $sv = $self->_src($c->[$j]);
-        $pv += $sv * $vv; $pv2 += $sv * $sv * $vv; $v += $vv;
-    }
-    return {
-        id => 'manual', type => 'manual', ts => $c->[$ai]{ts}, tf => $self->{_tf},
-        anchor_price => $self->_src($c->[$ai]),
-        cum_pv => $pv, cum_pv2 => $pv2, cum_v => $v,
-        value => ($v > 0 ? $pv / $v : undef), stdev => _stdev($pv, $pv2, $v),
-        state => 'active', origin => { manual_ts => $ts },
-        start_idx => $ai, end_idx => $n-1, end_ts => $c->[$n-1]{ts},
-    };
-}
+    my $source = $self->{_manual_source} // 'session';
+    my $key = "$ts:$source:$n";
+    return $self->{_ma_cache} if ($self->{_ma_cache_key} // '') eq $key;
 
-sub _new_anchor {
-    my ($self, $type, $i, $cum_pv, $cum_pv2, $cum_v, $ts, $anchor_price, $origin) = @_;
-    # sin duplicar: si ya existe un ancla de este tipo con el mismo ts, no crear.
-    for my $a (@{ $self->{_anchors} }) {
-        return if $a->{type} eq $type && $a->{ts} == $ts;
+    # (1) vela de REFERENCIA = primera con ts >= _manual_ts (busqueda binaria,
+    #     velas ordenadas por ts). Es el fallback si la fuente no tiene eventos.
+    my $ref;
+    if ($c->[$n-1]{ts} < $ts) {
+        $ref = $n - 1;                       # el clic cae despues de todos los datos
+    } else {
+        my ($lo, $hi) = (0, $n - 1);
+        while ($lo <= $hi) {
+            my $mid = int(($lo + $hi) / 2);
+            if ($c->[$mid]{ts} >= $ts) { $ref = $mid; $hi = $mid - 1; }
+            else { $lo = $mid + 1; }
+        }
     }
-    # una activa por tipo: la anterior del mismo tipo se congela (inactive).
-    for my $a (@{ $self->{_anchors} }) {
-        $a->{state} = 'inactive' if $a->{state} eq 'active' && $a->{type} eq $type;
-    }
-    my $a = {
-        id => $self->{_next_id}++, type => $type, ts => $ts, tf => $self->{_tf},
-        anchor_price => $anchor_price, cum_pv => $cum_pv, cum_pv2 => $cum_pv2, cum_v => $cum_v,
-        value => ($cum_v > 0 ? $cum_pv / $cum_v : undef),
-        stdev => _stdev($cum_pv, $cum_pv2, $cum_v),
-        state => 'active', origin => $origin, start_idx => $i, end_idx => $i, end_ts => $ts,
-    };
-    push @{ $self->{_anchors} }, $a;
+    $ref //= 0;
 
-    # cap de anclas INACTIVAS (las activas nunca se descartan)
-    my @inact = grep { $_->{state} eq 'inactive' } @{ $self->{_anchors} };
-    if (@inact > $self->{max_inactive}) {
-        my %drop = map { $_->{id} => 1 } @inact[0 .. (@inact - $self->{max_inactive} - 1)];
-        @{ $self->{_anchors} } = grep { !$drop{$_->{id}} } @{ $self->{_anchors} };
-    }
-    return $a;
+    # (2) el ancla NUNCA cambia de vela por la fuente: las lineas SIEMPRE nacen
+    #     en la vela anclada por el usuario ("el ancla solo se mueve si yo lo
+    #     muevo"). La FUENTE solo define el PRECIO BASE dentro de esa vela
+    #     ('open'=APERTURA; session/BOS/CHoCH/POC=HLC3, via _src): reposiciona
+    #     el rombo dentro de la vela y el primer valor del VWAP, que coinciden
+    #     (las lineas nacen del rombo).
+    my $ai = $ref;
+
+    # Objeto LIGERO: value/stdev/cum_* quedan undef a proposito. El overlay dibuja
+    # el VWAP y las bandas del tramo VISIBLE con vwap_line (que reacumula desde
+    # start_idx). Nadie fuera de aqui usa value/stdev/cum_* del ancla.
+    my $anchor = {
+        id => 'manual', type => 'manual', source => $source,
+        ts => $c->[$ai]{ts}, tf => $self->{_tf},
+        # ANCLA DEL USUARIO (fija en su vela): la vela CLICADA, al PRECIO BASE de
+        # la fuente activa (Apertura de mercado -> open de la vela, como en
+        # TradingView: verde=lado inferior del cuerpo, roja=superior; el resto ->
+        # HLC3). El marcador NO cambia de vela al cambiar la fuente (solo el
+        # usuario lo mueve); su altura sigue el precio base de la fuente.
+        ref_idx      => $ref,
+        anchor_price => $self->_src($c->[$ref]),
+        value => undef, stdev => undef,
+        state => 'active', origin => { manual_ts => $ts, source => $source },
+        # start_idx = donde NACE el calculo del VWAP/bandas (la vela clicada en
+        # 'session'; el evento de la fuente en open/BOS/CHoCH/POC).
+        start_idx => $ai, end_idx => $n - 1, end_ts => $c->[$n-1]{ts},
+    };
+    $self->{_ma_cache_key} = $key;
+    $self->{_ma_cache}     = $anchor;
+    return $anchor;
 }
 
 1;

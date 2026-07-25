@@ -898,62 +898,75 @@ $make_chk->($col_vp, 'Histograma', \$VP{show_hist},   $leaf_vp);
 $make_chk->($col_vp, 'Ancla',      \$VP{show_anchor}, $leaf_vp);
 
 # =============================================================================
-# Columna ANCHORED VWAP (5 anclas: Sesion / Apertura / BOS / CHoCH / POC).
-# FASE-2.5. Multipivote: varias anclas activas a la vez.
+# Columna ANCHORED VWAP: UN solo VWAP anclado manualmente.
+# FASE-2.5. El usuario ANCLA con un clic y el VWAP + bandas nacen SIEMPRE en
+# esa vela: el ancla NO cambia de vela al cambiar la FUENTE (solo el usuario la
+# mueve, con clic o arrastre). La FUENTE define el PRECIO BASE dentro de la
+# vela anclada (Apertura de mercado = apertura de la vela; Inicio de Sesion /
+# BOS / CHoCH / POC = HLC3): reposiciona el rombo en la vela y de ahi nacen
+# las lineas.
 # =============================================================================
-my %AV = ( show_session => 0, show_open => 0, show_bos => 0, show_choch => 0, show_poc => 0 );
 # Bandas del VWAP (desv. estandar x1/x2/x3). Defaults del Pine: x1/x2 ON, x3 OFF.
 my %AVB = ( show_band1 => 1, show_band2 => 1, show_band3 => 0 );
-my $av_master = 0;
+my $av_on     = 0;           # master mostrar/ocultar el VWAP
+my $av_source = 'session';   # fuente del ancla (default: inicio de sesion)
+$vwap_ind->set_manual_source($av_source);
+
 my $refresh_av = sub {
-    $vwap_overlay->set_flag($_, $AV{$_})  for keys %AV;
     $vwap_overlay->set_flag($_, $AVB{$_}) for keys %AVB;
-    my $any = 0; $any ||= $AV{$_} for keys %AV;
-    $any ||= $vwap_ind->has_manual_anchor;   # visible tambien con ancla MANUAL
-    $overlay_mgr->set_visible('avwap', $any ? 1 : 0);
+    # visible solo si esta activado Y hay un ancla puesta (si no, no hay que dibujar)
+    my $vis = ($av_on && $vwap_ind->has_manual_anchor) ? 1 : 0;
+    $overlay_mgr->set_visible('avwap', $vis);
     $engine->request_render;
 };
-my $sync_av_master = sub { my $all = 1; $all &&= $AV{$_} for keys %AV; $av_master = $all ? 1 : 0; };
-my $leaf_av = sub { $refresh_av->(); $sync_av_master->(); };
 
 my $col_av = $make_col->('Anchored VWAP', '#26a69a');
-$make_chk->($col_av, 'Activar VWAP', \$av_master, sub {
-    $AV{$_} = $av_master for keys %AV; $refresh_av->();
-});
-$make_chk->($col_av, 'Inicio sesion',   \$AV{show_session}, $leaf_av);
-$make_chk->($col_av, 'Apertura mercado', \$AV{show_open},   $leaf_av);
-$make_chk->($col_av, 'BOS',   \$AV{show_bos},   $leaf_av);
-$make_chk->($col_av, 'CHoCH', \$AV{show_choch}, $leaf_av);
-$make_chk->($col_av, 'POC',   \$AV{show_poc},   $leaf_av);
+$make_chk->($col_av, 'Activar VWAP', \$av_on, $refresh_av);
 
-# --- ANCLA MANUAL (clic del usuario) + bandas (desv. estandar x1/x2/x3) ---
+# --- FUENTE del ancla (una sola activa; reancla el VWAP al evento mas cercano) ---
+$col_av->Label(-text => 'Fuente del ancla:', -font => 'TkDefaultFont 8 bold',
+    -anchor => 'w')->pack(-side => 'top', -anchor => 'w', -fill => 'x', -pady => [4,0]);
+for my $s ( ['session','Inicio de sesion'], ['open','Apertura mercado'],
+            ['BOS','BOS'], ['CHoCH','CHoCH'], ['POC','POC'] ) {
+    my ($val, $lbl) = @$s;
+    $col_av->Radiobutton(
+        -text => $lbl, -value => $val, -variable => \$av_source,
+        -font => 'TkDefaultFont 8', -anchor => 'w', -selectcolor => '#26a69a',
+        -command => sub { $vwap_ind->set_manual_source($av_source); $refresh_av->(); },
+    )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+}
+
+# --- Bandas (desv. estandar x1/x2/x3) ---
 $make_chk->($col_av, 'Banda x1 (verde)',   \$AVB{show_band1}, $refresh_av);
 $make_chk->($col_av, 'Banda x2 (naranja)', \$AVB{show_band2}, $refresh_av);
 $make_chk->($col_av, 'Banda x3 (rojo)',    \$AVB{show_band3}, $refresh_av);
 
-# Boton: entra en modo seleccion; el proximo clic sobre una vela ancla el VWAP.
+# Boton: entra en modo seleccion; el proximo clic sobre una vela fija la
+# REFERENCIA. El VWAP se ancla en el evento de la fuente actual mas cercano.
 $col_av->Button(
     -text => 'Anclar VWAP (clic vela)', -font => 'TkDefaultFont 8',
     -command => sub {
         $engine->begin_candle_pick(sub {
             my ($idx, $c) = @_;
             return unless $c;
-            $vwap_ind->set_manual_anchor($c->{ts});   # ancla por timestamp
+            $vwap_ind->set_manual_anchor($c->{ts});   # referencia por timestamp
+            $av_on = 1;                               # anclar auto-activa el VWAP
             $refresh_av->();                          # visible + re-render
         });
     },
 )->pack(-side => 'top', -anchor => 'w', -fill => 'x', -pady => 1);
 
-# Boton: quita el ancla manual (mantiene las anclas automaticas).
+# Boton: quita el ancla (oculta el VWAP).
 $col_av->Button(
     -text => 'Quitar ancla', -font => 'TkDefaultFont 8',
     -command => sub { $vwap_ind->clear_manual_anchor; $refresh_av->(); },
 )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
 
-# Arrastre del marcador: el engine consulta el indice del ancla (get) y la
-# reubica en la vela bajo el cursor (set), recalculando el VWAP en vivo.
+# Arrastre del marcador: el engine consulta el indice del ANCLA DEL USUARIO
+# (ref_idx = vela clicada, donde se dibuja el marcador) y la reubica en la vela
+# bajo el cursor (set), recalculando el VWAP en vivo.
 $engine->set_vwap_anchor_hooks(
-    sub { my $ma = $vwap_ind->get_manual_anchor; $ma ? $ma->{start_idx} : undef; },
+    sub { my $ma = $vwap_ind->get_manual_anchor; $ma ? ($ma->{ref_idx} // $ma->{start_idx}) : undef; },
     sub {
         my ($idx) = @_;
         my $c = $engine->{market}->get_candle($idx);
