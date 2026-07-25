@@ -17,13 +17,14 @@ my @DAY_NAMES = qw(Mon Tue Wed Thu Fri Sat Sun);
 # Temporalidades derivadas soportadas (todo excepto 1m, que es la base
 # alimentada directamente por add_candle).
 # -----------------------------------------------------------------------------
-my @DERIVED_TIMEFRAMES = qw(5m 15m 30m 1h 2h 4h D W);
+my @DERIVED_TIMEFRAMES = qw(5m 10m 15m 30m 1h 2h 4h D W);
 
 # Temporalidades intradia que se agregan por bucketing directo sobre el
 # epoch (igual que 5m/15m en Fase 1). Estos intervalos dividen exacto a
 # 1440 min/dia, asi que el ancla es estable sin convertir a zona local.
 my %TF_MINUTES = (
     '5m'  => 5,
+    '10m' => 10,
     '15m' => 15,
     '30m' => 30,
     '1h'  => 60,

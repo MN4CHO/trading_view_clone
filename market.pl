@@ -491,7 +491,7 @@ my $tf_lbl = $tf_frame->Label(%bs,
 )->pack(-side => 'left', -padx => 4, -pady => 2);
 
 my %tf_btns;
-for my $tf (qw(1m 5m 15m 1h 2h 4h D W)) {
+for my $tf (qw(1m 5m 10m 15m 1h 2h 4h D W)) {
     my $btn = $tf_frame->Button(%bs,
         -text    => $tf,
         -font    => 'TkDefaultFont 9 bold',
