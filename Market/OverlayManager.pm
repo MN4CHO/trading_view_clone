@@ -63,16 +63,25 @@ sub is_visible {
     return $self->{_visible}{$name} ? 1 : 0;
 }
 
+# on_visibility_change: hook opcional que se dispara cuando cambia la visibilidad
+# de un overlay (lo usa el Replay para reconstruir el indicador recien activado).
+sub on_visibility_change { $_[0]->{_on_vis_change} = $_[1]; }
+sub _fire_vis_change { $_[0]->{_on_vis_change}->() if $_[0]->{_on_vis_change}; }
+
 sub set_visible {
     my ($self, $name, $visible) = @_;
     return unless exists $self->{overlays}{$name};
-    $self->{_visible}{$name} = $visible ? 1 : 0;
+    my $new = $visible ? 1 : 0;
+    my $changed = ($self->{_visible}{$name} // 0) != $new;
+    $self->{_visible}{$name} = $new;
+    $self->_fire_vis_change if $changed;
 }
 
 sub toggle {
     my ($self, $name) = @_;
     return unless exists $self->{overlays}{$name};
     $self->{_visible}{$name} = $self->{_visible}{$name} ? 0 : 1;
+    $self->_fire_vis_change;
     return $self->{_visible}{$name};
 }
 

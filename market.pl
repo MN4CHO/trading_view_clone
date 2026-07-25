@@ -364,6 +364,39 @@ $replay = Market::Replay->new(
 );
 
 # =============================================================================
+# OPTIMIZACION DE REPLAY: al arrancar el replay solo se reconstruyen los
+# indicadores de los overlays ACTIVOS + sus dependencias (+ ATR para el panel),
+# en vez de los 7. Los que estan apagados no se recalculan (su overlay no se
+# dibuja y ningun overlay activo depende de ellos). El resultado de cada
+# indicador incluido es IDENTICO al rebuild completo (mismo dato, misma frontera).
+# =============================================================================
+my %IND_DEPS = (            # indicador -> el mismo + sus dependencias
+    atr       => [qw(atr)],
+    zigzag    => [qw(zigzag)],
+    liquidity => [qw(atr liquidity)],
+    smc       => [qw(atr zigzag liquidity smc)],
+    vp        => [qw(atr zigzag liquidity smc vp)],
+    vwap      => [qw(atr zigzag liquidity smc vp vwap)],
+    strategy  => [qw(atr strategy)],
+);
+my %OVL_IND = (            # overlay -> indicador que lo alimenta
+    smc => 'smc', liquidity => 'liquidity', zigzag => 'zigzag',
+    strategy => 'strategy', volumeprofile => 'vp', avwap => 'vwap',
+);
+my $needed_indicators = sub {
+    my %need = ( atr => 1 );   # el panel ATR siempre necesita el ATR
+    for my $ovl (keys %OVL_IND) {
+        next unless $overlay_mgr->is_visible($ovl);
+        $need{$_} = 1 for @{ $IND_DEPS{ $OVL_IND{$ovl} } };
+    }
+    return [ keys %need ];
+};
+$replay->set_needed_indicators($needed_indicators);
+# Activar/desactivar un overlay durante el replay reconstruye el indicador
+# recien necesario hasta la frontera actual (no-op si el replay no esta activo).
+$overlay_mgr->on_visibility_change(sub { $replay->rebuild_needed; });
+
+# =============================================================================
 # TOOLBAR — se crea ANTES de registrar callbacks para que los botones existan
 # =============================================================================
 my %bs = (
@@ -869,10 +902,14 @@ $make_chk->($col_vp, 'Ancla',      \$VP{show_anchor}, $leaf_vp);
 # FASE-2.5. Multipivote: varias anclas activas a la vez.
 # =============================================================================
 my %AV = ( show_session => 0, show_open => 0, show_bos => 0, show_choch => 0, show_poc => 0 );
+# Bandas del VWAP (desv. estandar x1/x2/x3). Defaults del Pine: x1/x2 ON, x3 OFF.
+my %AVB = ( show_band1 => 1, show_band2 => 1, show_band3 => 0 );
 my $av_master = 0;
 my $refresh_av = sub {
-    $vwap_overlay->set_flag($_, $AV{$_}) for keys %AV;
+    $vwap_overlay->set_flag($_, $AV{$_})  for keys %AV;
+    $vwap_overlay->set_flag($_, $AVB{$_}) for keys %AVB;
     my $any = 0; $any ||= $AV{$_} for keys %AV;
+    $any ||= $vwap_ind->has_manual_anchor;   # visible tambien con ancla MANUAL
     $overlay_mgr->set_visible('avwap', $any ? 1 : 0);
     $engine->request_render;
 };
@@ -888,6 +925,41 @@ $make_chk->($col_av, 'Apertura mercado', \$AV{show_open},   $leaf_av);
 $make_chk->($col_av, 'BOS',   \$AV{show_bos},   $leaf_av);
 $make_chk->($col_av, 'CHoCH', \$AV{show_choch}, $leaf_av);
 $make_chk->($col_av, 'POC',   \$AV{show_poc},   $leaf_av);
+
+# --- ANCLA MANUAL (clic del usuario) + bandas (desv. estandar x1/x2/x3) ---
+$make_chk->($col_av, 'Banda x1 (verde)',   \$AVB{show_band1}, $refresh_av);
+$make_chk->($col_av, 'Banda x2 (naranja)', \$AVB{show_band2}, $refresh_av);
+$make_chk->($col_av, 'Banda x3 (rojo)',    \$AVB{show_band3}, $refresh_av);
+
+# Boton: entra en modo seleccion; el proximo clic sobre una vela ancla el VWAP.
+$col_av->Button(
+    -text => 'Anclar VWAP (clic vela)', -font => 'TkDefaultFont 8',
+    -command => sub {
+        $engine->begin_candle_pick(sub {
+            my ($idx, $c) = @_;
+            return unless $c;
+            $vwap_ind->set_manual_anchor($c->{ts});   # ancla por timestamp
+            $refresh_av->();                          # visible + re-render
+        });
+    },
+)->pack(-side => 'top', -anchor => 'w', -fill => 'x', -pady => 1);
+
+# Boton: quita el ancla manual (mantiene las anclas automaticas).
+$col_av->Button(
+    -text => 'Quitar ancla', -font => 'TkDefaultFont 8',
+    -command => sub { $vwap_ind->clear_manual_anchor; $refresh_av->(); },
+)->pack(-side => 'top', -anchor => 'w', -fill => 'x');
+
+# Arrastre del marcador: el engine consulta el indice del ancla (get) y la
+# reubica en la vela bajo el cursor (set), recalculando el VWAP en vivo.
+$engine->set_vwap_anchor_hooks(
+    sub { my $ma = $vwap_ind->get_manual_anchor; $ma ? $ma->{start_idx} : undef; },
+    sub {
+        my ($idx) = @_;
+        my $c = $engine->{market}->get_candle($idx);
+        if ($c) { $vwap_ind->set_manual_anchor($c->{ts}); $engine->request_render; }
+    },
+);
 
 # =============================================================================
 # Columna ZIGZAG (Interno verde/rojo + Externo azul) — ultima columna: la

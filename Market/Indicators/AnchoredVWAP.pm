@@ -51,6 +51,9 @@ sub new {
         _smc_seen     => 0,
         _vp_seen      => 0,
         _market_data  => undef,
+        _manual_ts    => undef,   # ts del ancla MANUAL (clic del usuario); persiste
+        # multiplicadores de banda (desv. estandar ponderada), igual que el Pine.
+        band_mults    => $a{band_mults} // [ 1.0, 2.0, 3.0 ],
     };
     bless $self, $class;
     return $self;
@@ -73,6 +76,17 @@ sub update_last {
     my ($self, $md) = @_;
     my $i = $md->last_index; return if $i < 0;
     $self->update_at_index($md, $i);
+}
+
+# Desviacion estandar PONDERADA por volumen (igual que el Pine de referencia):
+#   variance = max(0, Sum(src^2*vol)/Sum(vol) - vwap^2) ; stdev = sqrt(variance).
+sub _stdev {
+    my ($pv, $pv2, $v) = @_;
+    return undef unless $v && $v > 0;
+    my $mean = $pv / $v;
+    my $var  = ($pv2 / $v) - ($mean * $mean);
+    $var = 0 if $var < 0;
+    return sqrt($var);
 }
 
 sub _src {
@@ -111,11 +125,13 @@ sub update_at_index {
     # (1) acumular la vela actual en las anclas YA activas (creadas antes de i).
     for my $a (@{ $self->{_anchors} }) {
         next unless $a->{state} eq 'active';
-        $a->{cum_pv} += $src * $vol;   # volumen 0 => suma 0
-        $a->{cum_v}  += $vol;
-        $a->{value}   = $a->{cum_v} > 0 ? $a->{cum_pv} / $a->{cum_v} : undef;
-        $a->{end_ts}  = $c->{ts};
-        $a->{end_idx} = $i;            # ultima vela acumulada (congela al pasar a inactive)
+        $a->{cum_pv}  += $src * $vol;         # volumen 0 => suma 0
+        $a->{cum_pv2} += $src * $src * $vol;  # para la desviacion estandar (bandas)
+        $a->{cum_v}   += $vol;
+        $a->{value}    = $a->{cum_v} > 0 ? $a->{cum_pv} / $a->{cum_v} : undef;
+        $a->{stdev}    = _stdev( $a->{cum_pv}, $a->{cum_pv2}, $a->{cum_v} );
+        $a->{end_ts}   = $c->{ts};
+        $a->{end_idx}  = $i;            # ultima vela acumulada (congela al pasar a inactive)
     }
 
     # (2) crear anclas nuevas para esta vela (init con la vela i; sin doble conteo).
@@ -124,7 +140,7 @@ sub update_at_index {
     if (!defined $self->{_cur_skey} || $self->{_cur_skey} != $skey) {
         $self->{_cur_skey} = $skey;
         $self->{_seen_open} = 0;   # nueva sesion: re-armar deteccion de apertura oficial
-        $self->_new_anchor('session', $i, $src*$vol, $vol, $c->{ts}, $src, { session_key => $skey });
+        $self->_new_anchor('session', $i, $src*$vol, $src*$src*$vol, $vol, $c->{ts}, $src, { session_key => $skey });
     }
     #   -- apertura oficial del mercado (distinta del inicio ETH): CRUCE hacia
     #      arriba del minuto de apertura (509->510), no un simple ">=". Asi no se
@@ -133,7 +149,7 @@ sub update_at_index {
         && $self->{_prev_lmin} < $self->{official_open_min}
         && $lm >= $self->{official_open_min}) {
         $self->{_seen_open} = 1;
-        $self->_new_anchor('open', $i, $src*$vol, $vol, $c->{ts}, $src,
+        $self->_new_anchor('open', $i, $src*$vol, $src*$src*$vol, $vol, $c->{ts}, $src,
                            { open_min => $self->{official_open_min} });
     }
     #   -- BOS / CHoCH confirmados (cursor sobre eventos de SMC; e->ts == ts de i)
@@ -145,7 +161,7 @@ sub update_at_index {
             $self->{_smc_seen}++;
             next if defined $self->{anchor_scope} && ($e->{scope}//'') ne $self->{anchor_scope};
             next unless $e->{type} eq 'BOS' || $e->{type} eq 'CHoCH';
-            $self->_new_anchor($e->{type}, $i, $src*$vol, $vol, $c->{ts}, $src,
+            $self->_new_anchor($e->{type}, $i, $src*$vol, $src*$src*$vol, $vol, $c->{ts}, $src,
                                { event_ts => $e->{ts}, dir => $e->{dir}, scope => $e->{scope} });
         }
     }
@@ -159,13 +175,14 @@ sub update_at_index {
             next if $p->{incomplete} || !$p->{_idxs} || !@{ $p->{_idxs} };
             my $pi = $self->_poc_control_index($p);
             next unless defined $pi && $pi <= $i;
-            my ($pv, $v) = (0, 0);
+            my ($pv, $pv2, $v) = (0, 0, 0);
             for my $j ($pi .. $i) {
                 my $cj = $self->{_c}[$j]; next unless $cj;
                 my $vv = $cj->{volume} // 0;
-                $pv += $self->_src($cj) * $vv; $v += $vv;
+                my $sj = $self->_src($cj);
+                $pv += $sj * $vv; $pv2 += $sj * $sj * $vv; $v += $vv;
             }
-            $self->_new_anchor('POC', $pi, $pv, $v, $self->{_c}[$pi]{ts}, $self->_src($self->{_c}[$pi]),
+            $self->_new_anchor('POC', $pi, $pv, $pv2, $v, $self->{_c}[$pi]{ts}, $self->_src($self->{_c}[$pi]),
                                { profile_id => $p->{id}, poc_price => $p->{poc_price} });
         }
     }
@@ -186,9 +203,10 @@ sub _poc_control_index {
     return defined $bk ? $idxs->[$bk] : undef;
 }
 
-# vwap_line: serie {idx,value} del VWAP de un ancla en [i_from,i_to] (recortada a
-# [start_idx, ultima procesada]). La FORMULA vive aqui (no en el overlay): el
-# render solo pide el tramo visible. El ultimo valor coincide con anchor->{value}.
+# vwap_line: serie {idx,value,stdev} del VWAP de un ancla en [i_from,i_to]
+# (recortada a [start_idx, ultima procesada]). La FORMULA vive aqui (no en el
+# overlay): el render solo pide el tramo visible y calcula las bandas value+-stdev*
+# mult. El ultimo valor coincide con anchor->{value}/anchor->{stdev}.
 sub vwap_line {
     my ($self, $a, $i_from, $i_to) = @_;
     my $s    = $a->{start_idx};
@@ -199,22 +217,69 @@ sub vwap_line {
     $i_from = $s   if $i_from < $s;
     $i_to   = $cap if $i_to   > $cap;
     return [] if $i_to < $i_from || !defined $s;
-    my ($pv, $v) = (0, 0);
+    my ($pv, $pv2, $v) = (0, 0, 0);
     for my $j ($s .. $i_from - 1) {
         my $c = $self->{_c}[$j] or next; my $vv = $c->{volume} // 0;
-        $pv += $self->_src($c) * $vv; $v += $vv;
+        my $sv = $self->_src($c);
+        $pv += $sv * $vv; $pv2 += $sv * $sv * $vv; $v += $vv;
     }
     my @out;
     for my $j ($i_from .. $i_to) {
         my $c = $self->{_c}[$j] or next; my $vv = $c->{volume} // 0;
-        $pv += $self->_src($c) * $vv; $v += $vv;
-        push @out, { idx => $j, value => ($v > 0 ? $pv / $v : undef) };
+        my $sv = $self->_src($c);
+        $pv += $sv * $vv; $pv2 += $sv * $sv * $vv; $v += $vv;
+        push @out, {
+            idx   => $j,
+            value => ($v > 0 ? $pv / $v : undef),
+            stdev => _stdev($pv, $pv2, $v),
+        };
     }
     return \@out;
 }
 
+# =============================================================================
+# ANCLA MANUAL (clic del usuario). Se guarda por TIMESTAMP y se computa BAJO
+# DEMANDA desde las velas cargadas: asi persiste ante zoom/pan/Replay/cambio de
+# TF (el ts es independiente del indice) y no interfiere con las 5 anclas auto.
+# =============================================================================
+sub set_manual_anchor {
+    my ($self, $ts) = @_;
+    $self->{_manual_ts} = $ts;   # el overlay/engine dispara el re-render
+    return $self->get_manual_anchor;
+}
+sub clear_manual_anchor { $_[0]->{_manual_ts} = undef; return; }
+sub has_manual_anchor   { return defined $_[0]->{_manual_ts} ? 1 : 0; }
+
+# get_manual_anchor: ancla manual resuelta contra las velas ACTUALES (hasta el
+# cutoff de Replay). Devuelve un objeto ancla compatible con vwap_line, o undef.
+sub get_manual_anchor {
+    my ($self) = @_;
+    my $ts = $self->{_manual_ts};
+    return undef unless defined $ts;
+    my $c = $self->{_c};
+    my $n = scalar @$c;
+    return undef unless $n;
+    # vela ancla = primera con ts >= _manual_ts (dentro del cutoff actual)
+    my $ai;
+    for my $j (0 .. $n-1) { if ($c->[$j]{ts} >= $ts) { $ai = $j; last; } }
+    return undef unless defined $ai;
+    my ($pv, $pv2, $v) = (0, 0, 0);
+    for my $j ($ai .. $n-1) {
+        my $vv = $c->[$j]{volume} // 0; my $sv = $self->_src($c->[$j]);
+        $pv += $sv * $vv; $pv2 += $sv * $sv * $vv; $v += $vv;
+    }
+    return {
+        id => 'manual', type => 'manual', ts => $c->[$ai]{ts}, tf => $self->{_tf},
+        anchor_price => $self->_src($c->[$ai]),
+        cum_pv => $pv, cum_pv2 => $pv2, cum_v => $v,
+        value => ($v > 0 ? $pv / $v : undef), stdev => _stdev($pv, $pv2, $v),
+        state => 'active', origin => { manual_ts => $ts },
+        start_idx => $ai, end_idx => $n-1, end_ts => $c->[$n-1]{ts},
+    };
+}
+
 sub _new_anchor {
-    my ($self, $type, $i, $cum_pv, $cum_v, $ts, $anchor_price, $origin) = @_;
+    my ($self, $type, $i, $cum_pv, $cum_pv2, $cum_v, $ts, $anchor_price, $origin) = @_;
     # sin duplicar: si ya existe un ancla de este tipo con el mismo ts, no crear.
     for my $a (@{ $self->{_anchors} }) {
         return if $a->{type} eq $type && $a->{ts} == $ts;
@@ -225,8 +290,9 @@ sub _new_anchor {
     }
     my $a = {
         id => $self->{_next_id}++, type => $type, ts => $ts, tf => $self->{_tf},
-        anchor_price => $anchor_price, cum_pv => $cum_pv, cum_v => $cum_v,
+        anchor_price => $anchor_price, cum_pv => $cum_pv, cum_pv2 => $cum_pv2, cum_v => $cum_v,
         value => ($cum_v > 0 ? $cum_pv / $cum_v : undef),
+        stdev => _stdev($cum_pv, $cum_pv2, $cum_v),
         state => 'active', origin => $origin, start_idx => $i, end_idx => $i, end_ts => $ts,
     };
     push @{ $self->{_anchors} }, $a;
