@@ -26,6 +26,8 @@ use Market::Overlays::SMC_Structures;
 use Market::Overlays::Liquidity;
 use Market::Indicators::ZigZag;
 use Market::Overlays::ZigZag;
+use Market::Indicators::GhostSwings;
+use Market::Overlays::GhostSwings;
 use Market::Overlays::Fibonacci;
 use Market::Indicators::DailyLevels;
 use Market::Overlays::DailyLevels;
@@ -234,6 +236,8 @@ my $vp_ind = Market::Indicators::VolumeProfile->new(
 my $vwap_ind = Market::Indicators::AnchoredVWAP->new(
     smc => $smc_ind, vp => $vp_ind, anchor_scope => 'external' );
 
+my $ghost_ind = Market::Indicators::GhostSwings->new(length => 50);
+
 # FASE-2.6 -- FLUJO OBLIGATORIO POR VELA. El orden de registro ES el orden de
 # actualizacion en rebuild_all/update_last (bars-outer x indicadores-inner). Las
 # dependencias son UNIDIRECCIONALES: cada consumidor se registra DESPUES de sus
@@ -242,6 +246,7 @@ $ind_manager->register('atr',       $atr_ind);   # (2) ATR base / temporalidades
 $ind_manager->register('zigzag',    $zz_ind);    # (3) estructura HH/HL (alimenta SMC)
 $ind_manager->register('liquidity', $liq_ind);   # (4,5,8) Liquidity + eventos + volumen multi-TF
 $ind_manager->register('smc',       $smc_ind);   # (6,7) BOS/CHoCH + FVG (lee zigzag + liquidity)
+$ind_manager->register('ghost',     $ghost_ind);
 $ind_manager->register('vp',        $vp_ind);    # (9) Volume Profile (lee eventos SMC)
 $ind_manager->register('vwap',      $vwap_ind);  # (10) Anchored VWAP (lee SMC + VP)
 $ind_manager->register('strategy',  $sb_ind);    # (11) Strategy Builder (independiente)
@@ -275,6 +280,9 @@ $overlay_mgr->register('liquidity', $liq_overlay, visible => 0);
 
 my $zz_overlay = Market::Overlays::ZigZag->new( source => $zz_ind );
 $overlay_mgr->register('zigzag', $zz_overlay, visible => 0);
+
+my $ghost_overlay = Market::Overlays::GhostSwings->new( source => $ghost_ind );
+$overlay_mgr->register('ghost', $ghost_overlay, visible => 0);
 
 my $fib_overlay = Market::Overlays::Fibonacci->new( source => $zz_ind );
 $overlay_mgr->register('fibonacci', $fib_overlay, visible => 0);
@@ -1001,6 +1009,29 @@ $make_chk->($col_zz, 'Activar ZigZag', \$zz_master, sub {
 });
 $make_chk->($col_zz, 'Interno',   \$ZZ{show_internal}, $leaf_zz);
 $make_chk->($col_zz, 'Externo (150)',   \$ZZ{show_external}, $leaf_zz);
+
+my %GHOST = ( show_pivots => 0, show_ghosts => 0, show_traces => 0 );
+my $ghost_master = 0;
+my $refresh_ghost = sub {
+    $ghost_overlay->set_flag($_, $GHOST{$_}) for keys %GHOST;
+    my $any = 0; $any ||= $GHOST{$_} for keys %GHOST;
+    $overlay_mgr->set_visible('ghost', $any ? 1 : 0);
+    $engine->request_render;
+};
+my $sync_ghost_master = sub {
+    my $all = 1; $all &&= $GHOST{$_} for keys %GHOST;
+    $ghost_master = $all ? 1 : 0;
+};
+my $leaf_ghost = sub { $refresh_ghost->(); $sync_ghost_master->(); };
+
+my $col_ghost = $make_col->('Ghost Swings', '#8e24aa');
+$make_chk->($col_ghost, 'Activar Ghost', \$ghost_master, sub {
+    $GHOST{$_} = $ghost_master for keys %GHOST;
+    $refresh_ghost->();
+});
+$make_chk->($col_ghost, 'Pivotes regulares', \$GHOST{show_pivots}, $leaf_ghost);
+$make_chk->($col_ghost, 'Fantasmas (G)',     \$GHOST{show_ghosts}, $leaf_ghost);
+$make_chk->($col_ghost, 'Rastros',           \$GHOST{show_traces}, $leaf_ghost);
 
 # --- Resolucion del ZigZag interno (equivalente al input "ZigZag Resolution"
 # del ZZMTF de TradingView). Cambiarla solo recalcula el zigzag interno
