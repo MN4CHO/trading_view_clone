@@ -71,11 +71,12 @@ sub render {
     my $line = $src->vwap_line($ma, $vfrom, $vto);
     return unless $line && @$line >= 2;
 
-    # PUNTO DE ANCLAJE UNICO (centro del rombo): anchorBar = ref_idx (vela de la
-    # señal), anchorPrice = anchor_price (apertura de esa vela). Se calcula UNA
-    # sola vez y lo comparten el ROMBO y el nacimiento de TODAS las lineas ->
-    # cero separacion horizontal o vertical, a cualquier zoom/scroll.
-    my $anchor_bar = $ma->{ref_idx} // $ma->{start_idx};
+    # PUNTO DE ANCLAJE UNICO (centro del rombo): anchorBar = start_idx (vela del
+    # ANCLA: la vela del usuario, o la confirmacion BOS/CHoCH buscada),
+    # anchorPrice = precio base de la fuente en esa vela. Se calcula UNA sola
+    # vez y lo comparten el ROMBO y el nacimiento de TODAS las lineas -> la
+    # marca y las lineas son el mismo punto, a cualquier zoom/scroll.
+    my $anchor_bar = $ma->{start_idx};
     my $ax = $scale->index_to_center_x($anchor_bar);
     my $ay = $scale->value_to_y($ma->{anchor_price});
 

@@ -898,13 +898,13 @@ $make_chk->($col_vp, 'Histograma', \$VP{show_hist},   $leaf_vp);
 $make_chk->($col_vp, 'Ancla',      \$VP{show_anchor}, $leaf_vp);
 
 # =============================================================================
-# Columna ANCHORED VWAP: UN solo VWAP anclado manualmente.
-# FASE-2.5. El usuario ANCLA con un clic y el VWAP + bandas nacen SIEMPRE en
-# esa vela: el ancla NO cambia de vela al cambiar la FUENTE (solo el usuario la
-# mueve, con clic o arrastre). La FUENTE define el PRECIO BASE dentro de la
-# vela anclada (Apertura de mercado = apertura de la vela; Inicio de Sesion /
-# BOS / CHoCH / POC = HLC3): reposiciona el rombo en la vela y de ahi nacen
-# las lineas.
+# Columna ANCHORED VWAP: UN VWAP anclado manualmente; la MARCA (rombo) y el
+# nacimiento de las lineas son SIEMPRE el mismo punto, y ahi REINICIAN las
+# sumas. Con Inicio de Sesion / Apertura / POC el ancla es EXACTAMENTE la vela
+# que el usuario ancla (la fuente solo cambia el precio base: Apertura=open,
+# resto=HLC3). Con BOS / CHoCH se busca la ultima confirmacion SMC en o antes
+# de la vela del usuario y el ancla se coloca ahi. Solo el usuario mueve el
+# ancla (clic o arrastre).
 # =============================================================================
 # Bandas del VWAP (desv. estandar x1/x2/x3). Defaults del Pine: x1/x2 ON, x3 OFF.
 my %AVB = ( show_band1 => 1, show_band2 => 1, show_band3 => 0 );
@@ -962,11 +962,11 @@ $col_av->Button(
     -command => sub { $vwap_ind->clear_manual_anchor; $refresh_av->(); },
 )->pack(-side => 'top', -anchor => 'w', -fill => 'x');
 
-# Arrastre del marcador: el engine consulta el indice del ANCLA DEL USUARIO
-# (ref_idx = vela clicada, donde se dibuja el marcador) y la reubica en la vela
-# bajo el cursor (set), recalculando el VWAP en vivo.
+# Arrastre del marcador: el engine consulta el indice del ROMBO (start_idx =
+# vela del ancla, donde se dibuja) y lo reubica en la vela bajo el cursor (set),
+# recalculando el VWAP en vivo (en BOS/CHoCH re-busca la confirmacion vigente).
 $engine->set_vwap_anchor_hooks(
-    sub { my $ma = $vwap_ind->get_manual_anchor; $ma ? ($ma->{ref_idx} // $ma->{start_idx}) : undef; },
+    sub { my $ma = $vwap_ind->get_manual_anchor; $ma ? $ma->{start_idx} : undef; },
     sub {
         my ($idx) = @_;
         my $c = $engine->{market}->get_candle($idx);

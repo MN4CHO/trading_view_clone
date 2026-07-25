@@ -3,14 +3,19 @@ package Market::Indicators::AnchoredVWAP;
 # =============================================================================
 # Market::Indicators::AnchoredVWAP   (2a fase -- Anchored VWAP unico re-anclable)
 #
-# UN solo VWAP anclado. El usuario ANCLA con un clic (_manual_ts) y el VWAP y
-# sus bandas nacen SIEMPRE en esa vela ("el ancla solo se mueve si yo lo
-# muevo"): la vela del ancla NO cambia con la FUENTE (_manual_source). La fuente
-# solo define el PRECIO BASE dentro de la vela anclada ('open'=APERTURA;
-# session/BOS/CHoCH/POC=HLC3), que reposiciona el rombo en la vela y el primer
-# valor del VWAP (nacen juntos). Incremental, respeta Replay via MarketData.
-# NO depende del Canvas. NO reimplementa BOS/CHoCH ni el Volume Profile:
-# CONSUME sus salidas (eventos registrados; no mueven el ancla manual).
+# UN solo VWAP anclado manualmente. El usuario ANCLA con un clic (_manual_ts) y
+# las sumas acumuladas de volumen y precio ponderado REINICIAN estrictamente en
+# la vela del ancla; la MARCA (rombo) y el NACIMIENTO de las lineas son siempre
+# el mismo punto. Segun la FUENTE (_manual_source):
+#   - Inicio de Sesion / Apertura de Mercado / POC: el ancla es EXACTAMENTE la
+#     vela donde el usuario anclo ("donde yo ancle, desde ahi las lineas"),
+#     cambiando solo el PRECIO BASE ('open'=APERTURA; el resto=HLC3).
+#   - BOS / CHoCH Confirmado (excepcion): se BUSCA la ultima confirmacion SMC
+#     EN o ANTES de la vela del usuario y el ancla (marca + lineas) se coloca
+#     en esa vela exacta (sin futuro; se re-busca al mover el ancla).
+# Solo el usuario mueve el ancla (clic o arrastre). Incremental, respeta Replay
+# via MarketData. NO depende del Canvas. NO reimplementa BOS/CHoCH ni el Volume
+# Profile: CONSUME sus salidas confirmadas.
 #
 # FORMULA (la aplica vwap_line desde el ancla efectiva): el precio base depende
 #   de la FUENTE del ancla ('open'=apertura de la vela; session/BOS/CHoCH/POC=
@@ -23,10 +28,10 @@ package Market::Indicators::AnchoredVWAP;
 #   _events{tipo}=[{idx,ts},...] (respetan el cutoff, sin futuro): 'session'
 #   (apertura ETH = cambio de bucket de sesion), 'open' (apertura oficial RTH,
 #   cruce del minuto local), 'BOS'/'CHoCH' (eventos CONFIRMADOS de SMC), 'POC'
-#   (vela de control de cada perfil CERRADO del Volume Profile). NO mueven el
-#   ancla manual (quedan disponibles para funciones futuras). reset() limpia
-#   _events (se re-registran en el rebuild); _manual_ts y _manual_source
-#   PERSISTEN (solo cambian por accion del usuario).
+#   (vela de control de cada perfil CERRADO del Volume Profile). Son los puntos
+#   donde el VWAP REINICIALIZA sus sumas (get_manual_anchor elige el vigente).
+#   reset() limpia _events (se re-registran en el rebuild); _manual_ts y
+#   _manual_source PERSISTEN (solo cambian por accion del usuario).
 # =============================================================================
 
 use strict;
@@ -310,13 +315,24 @@ sub get_manual_anchor {
     }
     $ref //= 0;
 
-    # (2) el ancla NUNCA cambia de vela por la fuente: las lineas SIEMPRE nacen
-    #     en la vela anclada por el usuario ("el ancla solo se mueve si yo lo
-    #     muevo"). La FUENTE solo define el PRECIO BASE dentro de esa vela
-    #     ('open'=APERTURA; session/BOS/CHoCH/POC=HLC3, via _src): reposiciona
-    #     el rombo dentro de la vela y el primer valor del VWAP, que coinciden
-    #     (las lineas nacen del rombo).
+    # (2) VELA DEL ANCLA segun la FUENTE:
+    #     - session / open / POC: EXACTAMENTE la vela donde el usuario anclo
+    #       ("donde yo ancle, desde ahi se grafican las lineas y se mantienen").
+    #     - BOS / CHoCH (excepcion): se BUSCA la ultima confirmacion SMC EN o
+    #       ANTES de la vela del usuario y el ancla se coloca ahi (sin futuro;
+    #       sin confirmaciones, cae a la vela del usuario).
+    #     La MARCA (rombo) y el NACIMIENTO de las lineas son SIEMPRE el mismo
+    #     punto (start_idx); las sumas del VWAP REINICIAN estrictamente ahi.
     my $ai = $ref;
+    if ($source eq 'BOS' || $source eq 'CHoCH') {
+        my $list = $self->{_events}{$source};
+        if ($list && @$list) {
+            for my $e (@$list) {          # registrados en orden ascendente
+                last if $e->{idx} > $ref; # sin futuro
+                $ai = $e->{idx};
+            }
+        }
+    }
 
     # Objeto LIGERO: value/stdev/cum_* quedan undef a proposito. El overlay dibuja
     # el VWAP y las bandas del tramo VISIBLE con vwap_line (que reacumula desde
@@ -324,17 +340,15 @@ sub get_manual_anchor {
     my $anchor = {
         id => 'manual', type => 'manual', source => $source,
         ts => $c->[$ai]{ts}, tf => $self->{_tf},
-        # ANCLA DEL USUARIO (fija en su vela): la vela CLICADA, al PRECIO BASE de
-        # la fuente activa (Apertura de mercado -> open de la vela, como en
-        # TradingView: verde=lado inferior del cuerpo, roja=superior; el resto ->
-        # HLC3). El marcador NO cambia de vela al cambiar la fuente (solo el
-        # usuario lo mueve); su altura sigue el precio base de la fuente.
+        # ref_idx = vela del CLIC del usuario (referencia de busqueda para BOS/
+        # CHoCH). El ROMBO se dibuja en start_idx (la vela del ancla) al PRECIO
+        # BASE de la fuente ('open'=apertura; el resto=HLC3): coincide con el
+        # primer valor del VWAP, asi la marca y las lineas nacen juntas.
         ref_idx      => $ref,
-        anchor_price => $self->_src($c->[$ref]),
+        anchor_price => $self->_src($c->[$ai]),
         value => undef, stdev => undef,
         state => 'active', origin => { manual_ts => $ts, source => $source },
-        # start_idx = donde NACE el calculo del VWAP/bandas (la vela clicada en
-        # 'session'; el evento de la fuente en open/BOS/CHoCH/POC).
+        # start_idx = vela del ANCLA: ahi REINICIAN las sumas y nacen las lineas.
         start_idx => $ai, end_idx => $n - 1, end_ts => $c->[$n-1]{ts},
     };
     $self->{_ma_cache_key} = $key;
