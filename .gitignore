@@ -13,3 +13,4 @@ features_scaled.csv
 features_scaled.parquet
 labels.parquet
 reporte_calidad.txt
+*.log
