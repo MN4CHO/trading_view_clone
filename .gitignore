@@ -13,4 +13,11 @@ features_scaled.csv
 features_scaled.parquet
 labels.parquet
 reporte_calidad.txt
+tsne_2d.png
+market_states.csv
+market_states.parquet
+fase_a_resumen.txt
+lstm_ghosts.params
+lstm_norm_params.json
+lstm_ghosts_predictions.csv
 *.log

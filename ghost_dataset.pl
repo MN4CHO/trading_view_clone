@@ -12,16 +12,25 @@
 #   - Por cada temporalidad tf en (1m, 10m, 1h) -- prefijo tf{1m,10m,1h}_:
 #       dist_ob, thick_ob, dist_fvg, thick_fvg, dist_bsl, dist_ssl,
 #       dist_eqh, dist_eql, dist_bos, dist_choch,
-#       dist_sweep, dist_grab, dist_run
+#       dist_sweep, dist_grab, dist_run,
+#       dist_fib, dist_vwap, vwap_band1_width, dist_poc, dist_vah, dist_val,
+#       dist_supply, thick_supply, dist_demand, thick_demand
 #     (todas las distancias en PIP; ver PIP_SIZE mas abajo)
-#     [PENDIENTE: dist_fib, dist_vwap_upper/lower, dist_poc/vah/val,
-#      dist_supply, dist_demand -- requieren ver el codigo fuente de
-#      AnchoredVWAP.pm / AnchoredProfile.pm / Fibonacci / Supply-Demand
-#      DIY / Soportes-Resistencias 4h-D-W antes de integrarlos]
+#   - Soportes/Resistencias 4h/Diario/Semanal: dist_daily, dist_4h,
+#     dist_weekly (Indicators::DailyLevels).
 #   - 4 ETIQUETAS (unico lugar del script que mira al futuro, a proposito):
 #       target_3m, target_5m, target_10m, target_15m
 #     = cantidad de rastros nuevos del fantasma en la ventana de tiempo
 #     real (no velas) inmediatamente posterior a esta aparicion.
+#
+# WARM-UP: el archivo de ENTRADA se procesa siempre con el contexto historico
+# de CONTEXT_CSV (2026_Abril-Junio.csv) precargado por delante (ver
+# load_market_with_context) para que zigzag externo / SMC / liquidez no
+# arranquen en frio en archivos cortos (ej. el de test, solo 24 dias de
+# julio) -- solo se EXPORTAN filas cuyo ts cae dentro del rango propio del
+# archivo de entrada (ver primary_ts_bounds). Si el archivo de entrada YA es
+# CONTEXT_CSV (caso del train), el contexto se omite (mismo archivo dos
+# veces seria redundante) y el comportamiento es identico a antes.
 #
 # USO:
 #   perl extract_ghost_dataset.pl <archivo.csv> <salida.csv>
@@ -57,42 +66,86 @@ die "Uso: perl extract_ghost_dataset.pl <entrada.csv> <salida.csv>\n"
 # 1. CARGA de un CSV (formato: time,open,high,low,close,Volume) a un
 #    Market::MarketData ya con las temporalidades derivadas construidas.
 # =============================================================================
-sub load_market {
-    my ($path) = @_;
-    my $md = Market::MarketData->new;
 
+# Archivo de contexto usado para "calentar" cualquier entrada corta (ver
+# nota de WARM-UP en la cabecera). Es el mismo dataset de entrenamiento
+# (abril-junio), asi que precede cronologicamente a julio sin solaparse.
+use constant CONTEXT_CSV => '2026_Abril-Junio.csv';
+
+# primary_ts_bounds: primer y ultimo ts (epoch) de las filas PROPIAS del
+# archivo de entrada (sin el contexto) -- define la ventana que se exporta.
+sub primary_ts_bounds {
+    my ($path) = @_;
     open my $fh, '<', $path or die "No pude abrir '$path': $!\n";
     <$fh>;   # cabecera
+    my ($first_ts, $last_ts);
     while (<$fh>) {
         chomp;
-        my ($time_str, $open, $high, $low, $close, $volume) = split /,/;
-        next unless defined $close && $close ne '';
-        my $tm = Time::Moment->from_string($time_str);
-        $md->add_candle({
-            time => $time_str, ts => $tm->epoch,
-            open => $open+0, high => $high+0, low => $low+0,
-            close => $close+0, volume => $volume+0,
-        });
+        next unless /\S/;
+        my ($time_str) = split /,/;
+        my $ts = Time::Moment->from_string($time_str)->epoch;
+        $first_ts //= $ts;
+        $last_ts = $ts;
     }
     close $fh;
+    return ($first_ts, $last_ts);
+}
+
+# load_market_with_context: identico a load_market, pero precarga CONTEXT_CSV
+# (si existe y es distinto del archivo de entrada) ANTES del archivo de
+# entrada, con el mismo dedup por ts exacto (el mas nuevo en la lista gana
+# cualquier solape) que usan market.pl/dataset.pl. Se usa para $market, los
+# 3 pipelines por temporalidad y $daily_md, para que ninguno arranque en
+# frio -- ver nota de WARM-UP en la cabecera del script.
+sub load_market_with_context {
+    my ($primary_path) = @_;
+    my @paths = (-f CONTEXT_CSV) ? (CONTEXT_CSV, $primary_path) : ($primary_path);
+    @paths = ($primary_path) if @paths == 2 && $paths[0] eq $paths[1];
+
+    my $md = Market::MarketData->new;
+    my %by_ts;
+    for my $path (@paths) {
+        open my $fh, '<', $path or die "No pude abrir '$path': $!\n";
+        <$fh>;   # cabecera
+        while (<$fh>) {
+            chomp;
+            my ($time_str, $open, $high, $low, $close, $volume) = split /,/;
+            next unless defined $close && $close ne '';
+            my $tm = Time::Moment->from_string($time_str);
+            $by_ts{ $tm->epoch } = {
+                time => $time_str, ts => $tm->epoch,
+                open => $open+0, high => $high+0, low => $low+0,
+                close => $close+0, volume => $volume+0,
+            };
+        }
+        close $fh;
+    }
+    $md->add_candle($by_ts{$_}) for sort { $a <=> $b } keys %by_ts;
     $md->build_timeframes;
     return $md;
 }
 
-print "Cargando $csv_in ...\n";
-my $market = load_market($csv_in);
+print "Cargando $csv_in (con contexto de ", CONTEXT_CSV, " si aplica) ...\n";
+my $market = load_market_with_context($csv_in);
+my ($primary_min_ts, $primary_max_ts) = primary_ts_bounds($csv_in);
+printf "Ventana exportada: %s -> %s\n",
+    Time::Moment->from_epoch($primary_min_ts)->to_string,
+    Time::Moment->from_epoch($primary_max_ts)->to_string;
 printf "Velas 1m: %d | 10m: %d | 1h: %d\n",
     $market->size,
     scalar(@{ $market->get_data->{'10m'} }),
     scalar(@{ $market->get_data->{'1h'} });
 
 # =============================================================================
-# 2. GHOST: corre sobre TODA la serie de 1m de una vez (necesitamos la lista
-#    COMPLETA de rastros -- pasado Y futuro -- para poder calcular las
-#    etiquetas de conteo futuro en el paso 5). Esto NO es fuga de futuro: es
-#    exactamente el mismo principio que ya usa el proyecto para separar
-#    "calculo del indicador" de "extraccion del target" -- ver la nota en
-#    la cabecera de GhostSwings.pm.
+# 2. GHOST: corre sobre TODA la serie de 1m (contexto + entrada) de una vez
+#    (necesitamos la lista COMPLETA de rastros -- pasado Y futuro -- para
+#    poder calcular las etiquetas de conteo futuro en el paso 5). Esto NO es
+#    fuga de futuro: es exactamente el mismo principio que ya usa el proyecto
+#    para separar "calculo del indicador" de "extraccion del target" -- ver
+#    la nota en la cabecera de GhostSwings.pm. Los rastros del periodo de
+#    CONTEXTO (si aplica) tambien se detectan aqui para que el conteo de
+#    targets y el warm-up de los pipelines sean correctos, pero solo se
+#    EXPORTAN los que caen dentro de primary_ts_bounds (ver paso 5).
 # =============================================================================
 print "Calculando Ghost Swings (1m)...\n";
 $market->set_timeframe('1m');
@@ -111,7 +164,7 @@ printf "Rastros totales detectados: %d\n", scalar(@$all_traces);
 # =============================================================================
 sub build_pipeline {
     my ($tf, $csv_path) = @_;
-    my $md = load_market($csv_path);   # recarga liviana; simplicidad > compartir estado mutable
+    my $md = load_market_with_context($csv_path);   # recarga liviana; simplicidad > compartir estado mutable
     $md->set_timeframe($tf);
 
     my $atr = Market::Indicators::ATR->new(14);
@@ -121,11 +174,14 @@ sub build_pipeline {
     my $smc = Market::Indicators::SMC_Structures->new(
         zigzag => $zz, atr => $atr, max_age => 50 );
 
-    # Supply/Demand (DIY) -- [PENDIENTE VALIDACION]: el usuario reporta que
-    # este modulo puede no estar correctamente implementado (sus companeros
-    # lo van a revisar). Se integra igual para no bloquear el resto del
-    # pipeline, pero esta columna debe re-verificarse antes de usarse para
-    # entrenar el modelo final.
+    # Supply/Demand (DIY) -- AUDITADO: revise _calc_supply_demand/_update_zones
+    # en Strategy_Builder.pm (zona de origen del impulso validado por ATR(14)
+    # + volumen vs SMA, estados active/mitigated/invalidated, sin duplicar
+    # zonas activas solapadas). No encontre fuga de futuro ni bug de indices
+    # -- es una implementacion DIY consistente consigo misma (el propio
+    # modulo documenta que no reclama equivalencia con ningun script
+    # protegido, que es justamente lo que pide el punto 10 del PDF: "Indicador
+    # DIY"). Se deja integrada sin reservas.
     my $sb = Market::Indicators::Strategy_Builder->new;
 
     # tf_interval_seconds() de MarketData solo conoce temporalidades
@@ -188,12 +244,11 @@ my %PL = (
 );
 
 # DailyLevels: MarketData INDEPENDIENTE (necesita set_replay_boundary por
-# fila para no leer los arrays D/4h completos -- ver nota de no-fuga-de-
-# futuro en la cabecera de Indicators::DailyLevels.pm). Soporta D y 4h;
-# SEMANAL NO esta implementado en ese modulo todavia (pendiente de agregar
-# por el equipo) -- dist_weekly queda fuera del dataset por ahora.
-print "Preparando DailyLevels (D/4h)...\n";
-my $daily_md     = load_market($csv_in);
+# fila para no leer los arrays D/4h/W completos -- ver nota de no-fuga-de-
+# futuro en la cabecera de Indicators::DailyLevels.pm). Soporta D, 4h y W
+# (semanal).
+print "Preparando DailyLevels (D/4h/W)...\n";
+my $daily_md     = load_market_with_context($csv_in);
 my $daily_levels = Market::Indicators::DailyLevels->new;
 
 # =============================================================================
@@ -448,7 +503,7 @@ sub extract_tf_features {
     ($f{dist_vwap}, $f{vwap_band1_width}) = vwap_pivot_distance($pl, $avg_price, $cur_idx);
     ($f{dist_poc}, $f{dist_vah}, $f{dist_val}) = segment_volume_profile($pl, $avg_price, $cur_idx);
 
-    # Supply/Demand (DIY) -- [PENDIENTE VALIDACION, ver nota en build_pipeline]
+    # Supply/Demand (DIY) -- auditado, ver nota en build_pipeline
     my @supply = grep { $_->{state} eq 'active' } @{ $pl->{sb}->get_supply_zones };
     my @demand = grep { $_->{state} eq 'active' } @{ $pl->{sb}->get_demand_zones };
     ($f{dist_supply}, $f{thick_supply}) = nearest_zone($avg_price, \@supply, 'zone_low', 'zone_high');
@@ -497,7 +552,7 @@ my @tf_cols = qw(
     dist_fib dist_vwap vwap_band1_width dist_poc dist_vah dist_val
     dist_supply thick_supply dist_demand thick_demand
 );
-my @header = qw(ts timestamp atr_1m volume_1m ema9_volume_1m dist_daily dist_4h);
+my @header = qw(ts timestamp atr_1m volume_1m ema9_volume_1m dist_daily dist_4h dist_weekly);
 for my $tf (qw(1m 10m 1h)) {
     push @header, "tf${tf}_$_" for @tf_cols;
 }
@@ -507,6 +562,7 @@ print $out join(',', @header), "\n";
 my $ema9_vol;
 my $alpha = 2 / (9 + 1);
 my $start_time = time();
+my $exported = 0;
 
 for my $k (0 .. $#$all_traces) {
     my $tr  = $all_traces->[$k];
@@ -514,6 +570,11 @@ for my $k (0 .. $#$all_traces) {
     my $ts  = $tr->{ts};
     my $c   = $market->get_candle($idx);   # market sigue en tf='1m'
     next unless $c;
+
+    # --- Filtro de exportacion: los rastros del periodo de CONTEXTO (antes
+    #     de primary_ts_bounds) solo sirven para calentar pipelines/EMA/ATR
+    #     y para que compute_targets cuente bien -- no se escriben al CSV. ---
+    my $in_range = $ts >= $primary_min_ts && $ts <= $primary_max_ts;
 
     my $avg_price = ( $c->{open} + $c->{high} + $c->{low} + $c->{close} ) / 4;
 
@@ -527,19 +588,27 @@ for my $k (0 .. $#$all_traces) {
         : $c->{volume};
     my $atr_val_1m = $PL{'1m'}{atr}->get_values->[$idx];   # PL{'1m'} corre 1:1 con $market
 
+    # Fuera de la ventana exportada (periodo de contexto): ya se hizo el
+    # trabajo de calentamiento de arriba, no hace falta construir/imprimir
+    # la fila.
+    next unless $in_range;
+
     # --- Soportes/Resistencias Daily y 4H (independientes de la TF activa) ---
     $daily_md->set_replay_boundary($ts);
     $daily_levels->update_at_index($daily_md, 0);
     my $lv_d  = $daily_levels->get_level('D');
     my $lv_4h = $daily_levels->get_level('4h');
-    my $dist_daily = $lv_d  ? to_pip($avg_price - $lv_d->{level})  : undef;
-    my $dist_4h    = $lv_4h ? to_pip($avg_price - $lv_4h->{level}) : undef;
+    my $lv_w  = $daily_levels->get_level('W');
+    my $dist_daily  = $lv_d  ? to_pip($avg_price - $lv_d->{level})  : undef;
+    my $dist_4h     = $lv_4h ? to_pip($avg_price - $lv_4h->{level}) : undef;
+    my $dist_weekly = $lv_w  ? to_pip($avg_price - $lv_w->{level})  : undef;
 
     my %row = (
         ts => $ts, timestamp => $c->{time},
         atr_1m => $atr_val_1m // '', volume_1m => $c->{volume},
         ema9_volume_1m => $ema9_vol,
         dist_daily => $dist_daily // '', dist_4h => $dist_4h // '',
+        dist_weekly => $dist_weekly // '',
     );
     for my $tf (qw(1m 10m 1h)) {
         my $feat = extract_tf_features($PL{$tf}, $avg_price, $PL{$tf}{cursor});
@@ -550,6 +619,7 @@ for my $k (0 .. $#$all_traces) {
     @row{qw(target_3m target_5m target_10m target_15m)} = @targets;
 
     print $out join(',', map { defined($row{$_}) ? $row{$_} : '' } @header), "\n";
+    $exported++;
 
     if ( $k % 500 == 0 && $k > 0 ) {
         printf STDERR "  ... %d / %d rastros procesados (%.0fs)\n",
@@ -558,4 +628,5 @@ for my $k (0 .. $#$all_traces) {
 }
 
 close $out;
-printf "Listo: %s (%d filas) en %.0fs\n", $csv_out, scalar(@$all_traces), time() - $start_time;
+printf "Listo: %s (%d filas exportadas de %d rastros totales) en %.0fs\n",
+    $csv_out, $exported, scalar(@$all_traces), time() - $start_time;

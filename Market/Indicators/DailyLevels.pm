@@ -5,18 +5,20 @@ package Market::Indicators::DailyLevels;
 #
 # Soporte/Resistencia por "coincidencia mas cercana" (revision del ingeniero,
 # entrega 2): se toma el precio de la ULTIMA vela completa de D (y por
-# separado de 4H), y se busca hacia atras, entre los 4 valores (O/H/L/C) de
+# separado de 4H y W), y se busca hacia atras, entre los 4 valores (O/H/L/C) de
 # CADA vela historica anterior de esa misma temporalidad, cual es el precio
 # mas CERCANO al precio actual (distancia minima). Ese nivel se marca:
 #   - Soporte    si esta POR DEBAJO del precio actual
 #   - Resistencia si esta POR ARRIBA del precio actual
 #
 # Independiente de la temporalidad ACTIVA del grafico: lee directamente los
-# arrays 'D' y '4h' de MarketData, para que "Show Daily HL" pueda mostrarse
-# en CUALQUIER temporalidad, incluida 1m (pedido explicito de la revision).
+# arrays 'D', '4h' y 'W' de MarketData, para que "Show Daily HL" pueda
+# mostrarse en CUALQUIER temporalidad, incluida 1m (pedido explicito de la
+# revision). 'W' (semanal) se agrego para cumplir con el punto 6 del PDF de
+# indicaciones ("soportes/resistencias 4h/diario/semanal").
 #
 # GARANTIA DE NO-FUGA DE FUTURO EN REPLAY:
-#   Los arrays 'D'/'4h' de MarketData se construyen UNA SOLA VEZ al arrancar
+#   Los arrays 'D'/'4h'/'W' de MarketData se construyen UNA SOLA VEZ al arrancar
 #   la app (build_timeframes), con el dataset COMPLETO -- no respetan la
 #   frontera de replay por si mismos (a diferencia del array de la TF activa,
 #   que si la respeta via _effective_last_index). Por eso aqui NO basta con
@@ -70,7 +72,7 @@ sub _recompute {
     my ($self, $md) = @_;
     my $boundary = $md->get_replay_boundary;
 
-    for my $tf ('D', '4h') {
+    for my $tf ('D', '4h', 'W') {
         my $arr = $md->get_data->{$tf};
         next unless $arr && @$arr;
 
