@@ -43,10 +43,8 @@ use Market::Indicators::SMC_Structures;
 my $market = Market::MarketData->new;
 
 my @csv_groups = (
-    ['2026_04.csv'],
-    ['2026_05.csv'],
-    ['2026_06.csv'],
-    ['2026_07_20.csv'],
+    ['2026_Abril-Junio.csv'],
+    ['2026_07_24.csv'],
 );
 
 my %by_ts;

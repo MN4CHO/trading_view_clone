@@ -188,7 +188,7 @@ sub update_at_index {
     # que cambia la temporalidad (ChartEngine::set_timeframe), igual que
     # el externo, para que la ventana se recalcule desde cero.
     my $active_arr = $md->get_data->{ $md->get_timeframe };
-    my $last_vis   = $md->last_index;
+    my $last_vis   = $i_active;
     return unless $active_arr && @$active_arr && $last_vis >= 0;
 
     $self->_update_internal($active_arr, $last_vis);

@@ -162,14 +162,13 @@ sub _sync_from_zigzag {
 
     my $st = $self->{_struct};
 
-    # Indicators::ZigZag::update_at_index no esta parametrizado por el indice
-    # de este tick: usa $md->last_index, que en un rebuild_all SIN frontera de
-    # replay devuelve el ULTIMO indice de TODO el dataset ya cargado. Por eso
-    # sus segmentos pueden materializarse de golpe muy por delante de este
-    # indicador (que si avanza vela a vela via _c). Para no adelantarnos,
-    # solo se copian/extienden segmentos cuyo ts NO supere la ultima vela ya
-    # vista en _c -- el resto se sincroniza en ticks posteriores conforme _c
-    # los va alcanzando.
+    # Indicators::ZigZag::update_at_index ya respeta el indice de este tick
+    # (fix: antes usaba $md->last_index en vez del indice recibido, lo que
+    # podia materializar segmentos de golpe muy por delante de este indicador
+    # cuando no habia frontera de replay). Se deja igual esta guarda por
+    # defensa en profundidad: solo se copian/extienden segmentos cuyo ts NO
+    # supere la ultima vela ya vista en _c -- el resto se sincroniza en ticks
+    # posteriores conforme _c los va alcanzando.
     my $now_ts = $self->{_c}[-1]{ts};
     my $list   = $st->{swings};
     my $n      = scalar @$segs;
