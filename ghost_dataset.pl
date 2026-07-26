@@ -163,6 +163,15 @@ sub pipeline_catch_up {
         && $arr->[ $pl->{cursor} + 1 ]{ts} + $itv <= $ts_boundary + 60 )
     {
         $pl->{cursor}++;
+        # CRITICO: Indicators::ZigZag::update_at_index IGNORA el indice que
+        # recibe -- usa $md->last_index() internamente (disenado para que
+        # Market::Replay controle la frontera via set_replay_boundary en la
+        # app real). Sin fijar esta frontera aqui, ZigZag ve TODO el dataset
+        # cargado desde la primera llamada (fuga de futuro masiva: un pivote
+        # de junio contaminando una fila de abril). Se fija la frontera del
+        # MarketData de ESTE pipeline a la vela que se acaba de procesar,
+        # exactamente el mismo patron que ya usa Market::Replay.pm.
+        $pl->{md}->set_replay_boundary( $arr->[ $pl->{cursor} ]{ts} );
         $pl->{atr}->update_at_index( $pl->{md}, $pl->{cursor} );
         $pl->{liq}->update_at_index( $pl->{md}, $pl->{cursor} );
         $pl->{zz}->update_at_index( $pl->{md}, $pl->{cursor} );
