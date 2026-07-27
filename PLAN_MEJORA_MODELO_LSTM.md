@@ -887,3 +887,117 @@ git log --oneline d1a90dd..HEAD
 | `b982aaa` | Fases 3 y 4 — normalización por ATR y targets estandarizados |
 | `5cff3ba` | Fase 5 — cierre sin cambios, hipótesis refutada |
 | `d096e86` | Fase 6 — R², persistencia, exactitud ±1 |
+
+## 7. VERLO: comprobar con los ojos que ahora predice
+
+Las métricas dicen que el modelo predice, pero conviene **verlo**. La prueba
+más directa es la siguiente: ordenar las predicciones de menor a mayor,
+partirlas en deciles, y mirar qué pasó **de verdad** en cada decil.
+
+- Un modelo que **replica la media** (el estado anterior al plan) daría el mismo
+  valor real en los 10 deciles, todos pegados a la media global.
+- Un modelo que **predice** hace que el valor real **suba** conforme sube la
+  predicción.
+
+Tras correr `perl train_lstm_ghosts.pl eval`, con
+`lstm_ghosts_predictions.csv` ya generado:
+
+```bash
+python3 - <<'PY'
+import csv, statistics
+rows=list(csv.DictReader(open('lstm_ghosts_predictions.csv')))
+for t in ['target_3m','target_5m','target_10m','target_15m']:
+    P=sorted((float(r['pred_'+t]), float(r[t])) for r in rows)
+    n=len(P); g=statistics.mean(y for _,y in P)
+    print(f"\n=== {t} (media real del test = {g:.2f}) ===")
+    print(f"  {'decil de prediccion':>20}  {'n':>4}  {'real':>6}   grafico")
+    for i in range(10):
+        c=P[i*n//10:(i+1)*n//10]
+        pm=statistics.mean(x for x,_ in c); am=statistics.mean(y for _,y in c)
+        print(f"  {i+1:2d}  pred~{pm:6.2f}      {len(c):4d}  {am:6.2f}   {'#'*int(round(am*5))}")
+PY
+```
+
+Salida real obtenida (2026-07-26, modelo de la Fase 4):
+
+```
+=== target_3m (media real del test = 1.25) ===
+   decil de prediccion     n    real   grafico
+   1  pred~  0.66       324    0.48   ##
+   2  pred~  0.92       324    0.80   ####
+   3  pred~  1.04       324    1.03   #####
+   4  pred~  1.13       324    1.19   ######
+   5  pred~  1.20       324    1.30   #######
+   6  pred~  1.27       324    1.30   ######
+   7  pred~  1.33       324    1.44   #######
+   8  pred~  1.40       324    1.50   ########
+   9  pred~  1.48       324    1.68   ########
+  10  pred~  1.60       324    1.77   #########
+
+=== target_15m (media real del test = 3.72) ===
+   decil de prediccion     n    real   grafico
+   1  pred~  2.38       324    2.30   ###########
+   2  pred~  2.90       324    2.86   ##############
+   3  pred~  3.14       324    3.24   ################
+   4  pred~  3.32       324    3.66   ##################
+   5  pred~  3.47       324    3.84   ###################
+   6  pred~  3.62       324    3.70   ###################
+   7  pred~  3.77       324    4.05   ####################
+   8  pred~  3.91       324    4.28   #####################
+   9  pred~  4.06       324    4.54   #######################
+  10  pred~  4.34       324    4.69   #######################
+```
+
+**Cómo leerlo.** En `target_3m`, cuando el modelo dice "pocos rastros"
+(decil 1) ocurren de media **0.48**; cuando dice "muchos" (decil 10) ocurren
+**1.77**. Son **3.7×** más rastros, y la media global es 1.25. El modelo
+distingue situaciones — no está emitiendo un número fijo. En `target_15m` el
+recorrido es 2.30 → 4.69.
+
+La escalera **no es perfectamente monótona** (deciles 5-6 se cruzan levemente
+en los cuatro horizontes) y eso es lo esperable con un R² de ~0.12: hay señal
+real, pero es débil frente al ruido. Presentarla como una escalera perfecta
+sería exagerar.
+
+**Señal de alarma:** si algún día los 10 deciles muestran prácticamente el mismo
+valor real, pegado a la media global, el modelo volvió a replicar la media y
+algo se rompió (mirar primero el R² de la tabla de métricas adicionales: sería
+≈ 0 o negativo).
+
+### Ver predicciones concretas, una por una
+
+```bash
+column -s, -t lstm_ghosts_predictions.csv | head -15
+```
+
+Columnas: `pred_*` es la salida continua, `predint_*` la recortada a ≥0 y
+redondeada, y `target_*` el etiquetado automático real. Para ver los casos donde
+el modelo se moja más (predicciones extremas, que es donde más se aprende
+mirando):
+
+```bash
+python3 - <<'PY'
+import csv
+rows=list(csv.DictReader(open('lstm_ghosts_predictions.csv')))
+rows.sort(key=lambda r: float(r['pred_target_3m']))
+print("--- las 8 predicciones MAS BAJAS de target_3m ---")
+for r in rows[:8]:
+    print(f"  {r['timestamp']}  pred={float(r['pred_target_3m']):.2f} -> real={r['target_3m']}")
+print("--- las 8 MAS ALTAS ---")
+for r in rows[-8:]:
+    print(f"  {r['timestamp']}  pred={float(r['pred_target_3m']):.2f} -> real={r['target_3m']}")
+PY
+```
+
+### Sobre gráficas
+
+**No hay gráfica para el modelo LSTM (Fase B)** y no se creó ninguna: en este
+entorno `matplotlib` no está instalado en el `python3` del sistema (`import
+matplotlib` falla) y no existe el `venv/` que usa `train_tsne_gmm_hmm.py` de la
+Fase A para generar `tsne_2d.png`. Por eso la comprobación visual de arriba está
+hecha con tablas ASCII, que no dependen de ninguna librería.
+
+Si se quiere un PNG para la exposición (por ejemplo, predicho vs. real, o la
+misma escalera de deciles como gráfico de barras), haría falta instalar
+`matplotlib` y añadir un script aparte — es directo a partir de
+`lstm_ghosts_predictions.csv`, que ya contiene todo lo necesario.
