@@ -886,4 +886,4 @@ git log --oneline d1a90dd..HEAD
 | `6c4aa61` | Fase 2 — 19 features nuevas + CSV regenerados |
 | `b982aaa` | Fases 3 y 4 — normalización por ATR y targets estandarizados |
 | `5cff3ba` | Fase 5 — cierre sin cambios, hipótesis refutada |
-| (este) | Fase 6 — R², persistencia, exactitud ±1 |
+| `d096e86` | Fase 6 — R², persistencia, exactitud ±1 |
