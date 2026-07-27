@@ -444,26 +444,20 @@ sub nearest_event_dist {
     return nearest_price_list($price, \@prices);
 }
 
-# EQH/EQL: distancia con signo al punto medio del par igual mas cercano de ese kind.
-# Blindado contra entradas con p1/p2 indefinidos (no deberia pasar segun
-# Liquidity.pm, pero se descartan en vez de propagar undef -- y se avisa
-# una sola vez por corrida para poder diagnosticar la causa real si se repite).
-my $warned_bad_equal = 0;
+# EQH/EQL: distancia con signo al punto medio del PAR (Indicators::Liquidity
+# los expone como {kind, points:[{index,ts,price}, {index,ts,price}], price,
+# last_index} -- el punto medio de points[0].price/points[1].price representa
+# la "zona" del par casi-igual, igual espiritu que el p1/p2 original pero
+# adaptado al esquema real de la reescritura de EQH/EQL (paridad LuxAlgo).
 sub nearest_equal_dist {
     my ($price, $equals, $kind) = @_;
     my @mids;
     for my $e (@$equals) {
         next unless $e->{kind} eq $kind;
-        if ( !defined($e->{p1}) || !defined($e->{p2}) ) {
-            unless ($warned_bad_equal) {
-                warn "AVISO: entrada 'equals' con p1/p2 indefinido -- kind=$e->{kind} i1=" .
-                     (defined($e->{i1}) ? $e->{i1} : 'undef') . " i2=" .
-                     (defined($e->{i2}) ? $e->{i2} : 'undef') . " (solo se avisa una vez)\n";
-                $warned_bad_equal = 1;
-            }
-            next;
-        }
-        push @mids, ( $e->{p1} + $e->{p2} ) / 2;
+        my $pts = $e->{points};
+        next unless $pts && @$pts == 2
+                 && defined($pts->[0]{price}) && defined($pts->[1]{price});
+        push @mids, ( $pts->[0]{price} + $pts->[1]{price} ) / 2;
     }
     return nearest_price_list($price, \@mids);
 }
@@ -628,5 +622,14 @@ for my $k (0 .. $#$all_traces) {
 }
 
 close $out;
+
+for my $tf (qw(1m 10m 1h)) {
+    my @eq = @{ $PL{$tf}{liq}{equals} };
+    my %by_kind;
+    $by_kind{$_->{kind}}++ for @eq;
+    printf STDERR "[$tf] equals totales: %d | EQH: %d | EQL: %d\n",
+        scalar(@eq), $by_kind{EQH}//0, $by_kind{EQL}//0;
+}
+
 printf "Listo: %s (%d filas exportadas de %d rastros totales) en %.0fs\n",
     $csv_out, $exported, scalar(@$all_traces), time() - $start_time;
