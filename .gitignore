@@ -21,3 +21,7 @@ lstm_ghosts.params
 lstm_norm_params.json
 lstm_ghosts_predictions.csv
 *.log
+
+# Documentos de trabajo (no forman parte del entregable)
+PLAN_MEJORA_MODELO_LSTM.md
+Indicaciones-Proyecto-parte-final_v1.0.pdf
