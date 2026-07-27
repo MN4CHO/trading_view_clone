@@ -20,7 +20,7 @@
 | 3 | Normalizar distancias por ATR en el entrenamiento | ✅ Completada |
 | 4 | Loss y salida correctas para conteos | ✅ Completada |
 | 5 | Re-sintonizar la regularización | ✅ Cerrada — hipótesis refutada, sin cambios |
-| 6 | Métricas defendibles para la exposición | ⬜ Pendiente |
+| 6 | Métricas defendibles para la exposición | ✅ Completada |
 
 ---
 
@@ -556,7 +556,7 @@ reportan como *verificación a posteriori*, no como criterio de elección.
 
 ## FASE 6 — Métricas defendibles para la exposición
 
-**Estado:** ⬜ Pendiente
+**Estado:** ✅ Completada (2026-07-26)
 **Archivo:** `train_lstm_ghosts.pl`, modo `eval`
 
 ### Cambios
@@ -574,7 +574,48 @@ Mantener el baseline de la media que ya está. El número honesto a presentar es
 
 ### Log
 
-_(pendiente)_
+**Implementado como estaba planeado.** Se añadieron a `train_lstm_ghosts.pl`
+las funciones `r2`, `hit_rates` y `persistence_preds`, más una segunda tabla en
+el modo `eval`.
+
+#### Decisión importante sobre el baseline de persistencia
+
+El plan decía "repetir el conteo observado en la ventana anterior", que admite
+dos lecturas, y **solo una es válida**:
+
+- ❌ *Repetir la etiqueta del rastro anterior.* No sirve: la ventana de esa
+  etiqueta se extiende hacia el **futuro** de `ts` (los rastros suelen estar a
+  60 s y la ventana es de 180-900 s), así que ese baseline estaría mirando datos
+  que todavía no existen. Sería un baseline artificialmente fuerte y tramposo.
+- ✅ *Contar los rastros ocurridos en `(ts−W, ts]`.* Es causal: solo cuenta
+  hechos ya ocurridos en el momento de predecir. Es la lectura implementada.
+
+Limitación conocida y anotada en el código: para las primeras filas del CSV de
+test la ventana hacia atrás cae fuera del archivo (los rastros de junio no están
+en él), así que su conteo queda subestimado. Afecta como mucho a los rastros de
+los primeros 900 s sobre 3240 filas.
+
+#### Resultados (config de la Fase 4, evaluada en julio)
+
+| | R² continuo | R² entero | exacto | ±1 rastro | Persistencia (MAE) | LSTM vs persistencia |
+|---|---|---|---|---|---|---|
+| `target_3m` | **+0.118** | +0.010 | 31.5% | **87.2%** | 1.033 | +19.8% |
+| `target_5m` | +0.081 | +0.062 | 22.5% | 71.5% | 1.511 | +23.7% |
+| `target_10m` | +0.062 | +0.042 | 15.6% | 45.9% | 2.445 | +27.5% |
+| `target_15m` | +0.054 | +0.036 | 12.4% | 37.1% | 3.105 | +27.9% |
+
+**El R² es la métrica que cierra el diagnóstico de la Fase 0:** antes del plan
+estaba entre −0.01 y −0.11 (peor que predecir la media); ahora es positivo en
+los cuatro horizontes. El modelo pasó de replicar la media a explicar varianza.
+
+**Aviso para no exagerar en la exposición:** el baseline de persistencia es
+**más débil** que el de la media (MAE 1.033 vs 0.872 en 3m), así que ese
+"+27.9%" es el número fácil. El número honesto que hay que presentar es la
+mejora sobre el baseline de la media, que es el rival duro: **+5.0 / +6.6 /
++4.4 / +3.4 %** (continuo).
+
+El R² de la versión entera vuelve a confirmar el compromiso del redondeo
+(+0.010 vs +0.118 en 3m): para R²/RMSE hay que usar la salida continua.
 
 ---
 
@@ -594,6 +635,26 @@ queda muy por debajo, el problema es de optimización, no de features.
 exacto de récords futuros es intrínsecamente ruidoso — pero es la diferencia
 entre "el modelo predice la media" y "el modelo predice".
 
+### Cumplimiento final (medido, sin maquillar)
+
+| Target | Objetivo MAE | LSTM continuo | LSTM entero | Objetivo R² | R² continuo |
+|---|---|---|---|---|---|
+| `target_3m` | ≥ +6% | +5.0% ⚠️ | +6.8% ✅ | ≥ +0.12 | +0.118 ⚠️ |
+| `target_5m` | ≥ +7% | +6.6% ⚠️ | +8.7% ✅ | ≥ +0.09 | +0.081 ⚠️ |
+| `target_10m` | ≥ +3.5% | +4.4% ✅ | +4.9% ✅ | ≥ +0.04 | +0.062 ✅ |
+| `target_15m` | ≥ +3% | +3.4% ✅ | +3.3% ✅ | ≥ +0.02 | +0.054 ✅ |
+
+**Lectura honesta:** con la salida continua, 2 de 4 horizontes cumplen el umbral
+y los otros dos (3m y 5m) se quedan **ligeramente por debajo** (5.0 vs 6.0 y 6.6
+vs 7.0; R² 0.118 vs 0.120 y 0.081 vs 0.090). Con la salida entera, los cuatro
+cumplen el umbral de MAE.
+
+Esto **no es un fallo**: los umbrales eran el techo de una *ridge* ajustada
+sobre el mismo test, o sea el mejor caso lineal posible; que el LSTM aterrice
+uno o dos puntos por debajo en los horizontes cortos es lo esperable, no un
+síntoma de que quede optimización sin hacer. La Fase 5 ya descartó que sea
+cuestión de hiperparámetros.
+
 ## Rollback
 
 - Commit antes de la Fase 2 (los CSV se sobrescriben).
@@ -606,3 +667,223 @@ El bloque de `git reset --hard upstream/main` sobre `feature/smc-unified-system`
 que circuló en el grupo era seguro en el momento de escribir esto (`d1a90dd` ya
 estaba en `upstream/main`, rama con 0 commits por delante). **Si se corre otra
 vez después de implementar este plan y antes de mergear, borra el trabajo.**
+
+---
+
+# RESUMEN FINAL — qué se cambió, por qué, y con qué efecto
+
+## El punto de partida
+
+El modelo "no aprendía a predecir". La causa **no** era el entrenamiento: era
+que las 75 features del dataset no contenían información sobre el objetivo.
+Medido con ridge sobre julio, daban un R² **negativo** (−0.01 a −0.11): peor
+que predecir siempre la media. Un modelo que colapsa a la media es el
+comportamiento *óptimo* cuando no hay señal, así que no había nada que arreglar
+en el LSTM mientras el dataset no cambiara.
+
+El síntoma que se leyó como progreso ("ya llega a la época 20 en vez de la 2")
+tampoco lo era: la sobre-regularización del commit `d1a90dd` hace que el modelo
+converja **más lento** a esa media, así que el early stopping tarda más en
+dispararse. Nada más.
+
+## Las cinco mejoras
+
+### 1. Exponer el estado del proceso de récords (Fase 1)
+
+**Qué:** cada rastro ahora lleva `prev_price`, `prev_index`, `pivot_index`,
+`pivot_price` y `n_in_leg`.
+
+**Por qué:** un rastro es *"se batió el extremo trackeado desde el último
+pivote"* — un proceso de récords. Lo que informa sobre cuántos récords vienen
+después es el estado de ese proceso, y ese estado no se podía reconstruir desde
+fuera a partir de `{index, ts, price, kind}`. Se comprobó además que **dos
+piernas consecutivas pueden compartir el mismo `kind`**, así que tampoco se
+podía deducir la pierna mirando los rastros desde fuera.
+
+**Efecto:** habilitante; sin esto la Fase 2 era imposible.
+
+### 2. Diecinueve features nuevas (Fase 2)
+
+**Qué:** 11 columnas de estado del fantasma y 8 de volatilidad/forma de vela.
+La dominante es `ghost_wick_atr` = |récord nuevo − cierre| / ATR (corr −0.22).
+
+**Por qué:** si el precio quedó lejos del extremo que acaba de marcar, vienen
+menos récords después. Es la mecánica del indicador convertida en feature.
+
+**Efecto:** de R² −0.01…−0.11 a **+0.13** en `target_3m`. Es **la** mejora; el
+resto son refinamientos sobre ella.
+
+### 3. Normalizar las distancias por ATR (Fase 3)
+
+**Qué:** las distancias del PDF se dividen por el ATR de 1m de su propia fila
+antes de estandarizar (en el entrenamiento, no en el extractor).
+
+**Por qué:** 200 pip no significan lo mismo en un día tranquilo que en uno
+agitado. En PIP absolutos esas columnas llegaban a **empeorar** el MAE.
+
+**Efecto:** `target_15m` de +1.3% a +2.6%. Se hizo en el entrenamiento para que
+el CSV conserve las columnas en PIP que el PDF exige, y para no duplicar ~69
+features colineales.
+
+### 4. Targets estandarizados y salida en unidades de conteo (Fase 4)
+
+**Qué:** los 4 targets se estandarizan para entrenar, la salida se
+des-estandariza en `eval`, y se reportan dos versiones (continua y entera ≥0).
+
+**Por qué:** `L2Loss` multi-salida repartía el gradiente según la varianza de
+cada horizonte (1.02 / 1.94 / 4.41 / 7.03), así que `target_15m` pesaba ~7× que
+`target_3m` **siendo el menos predecible de los cuatro**.
+
+**Efecto:** +5.0 / +6.6 / +4.4 / +3.4 % (continuo). Es donde el modelo alcanza
+prácticamente el techo lineal del dataset.
+
+### 5. Métricas que permiten defender el resultado (Fase 6)
+
+**Qué:** R², baseline de persistencia causal, y exactitud exacta / ±1 rastro.
+
+**Por qué:** el MAE absoluto no dice si el modelo aprendió. El R² sí: es la
+métrica que delataba el estado anterior (negativo) y la que demuestra el actual
+(positivo en los cuatro horizontes).
+
+## Lo que se decidió NO cambiar (y por qué)
+
+Tan importante como lo anterior, porque evita que alguien lo reintente:
+
+| Idea | Veredicto | Motivo medido |
+|---|---|---|
+| Bajar la regularización (Fase 5) | **Rechazada** | 22 entrenamientos: `wd=0.01` está en el óptimo; debilitarlo cuesta ~0.04 de `val_loss`, 20× el ruido entre corridas |
+| Ampliar `SEQ_LEN` | Rechazada | `seq_len` 1/2/3/5 dan lo mismo (±0.1 pp): la recurrencia no aporta aquí |
+| Más neuronas (`hidden` 32/64) | Rechazada | `hidden` 8/16/32 dan lo mismo: la capacidad no es la restricción activa |
+| `log1p(target)` | Rechazada | Empeora 10m y 15m |
+| Descartar el arranque en frío de abril | Rechazada | Se pierde más por tener menos datos que lo que se gana alineando distribuciones |
+| Adoptar `h16 d0.4 wd0.01` (nominalmente #1) | Rechazada | Dentro del ruido de inicialización; adoptarla sería sobreajustar a la partición de validación |
+
+## Qué presentar (y qué no)
+
+- **El número honesto es la mejora sobre el baseline de la media:**
+  **+5.0 / +6.6 / +4.4 / +3.4 %** (continuo) o **+6.8 / +8.7 / +4.9 / +3.3 %**
+  (entero). Ese baseline es el rival duro.
+- **No** presentar el "+27.9% sobre persistencia" como titular: ese baseline es
+  más débil que el de la media (MAE 3.105 vs 2.316), así que es el número fácil.
+- **El más legible para la audiencia:** acierta el número exacto de rastros el
+  **31.5%** de las veces a 3 minutos, y se queda a ±1 rastro el **87.2%**.
+- **Ser explícito con el techo:** predecir el conteo exacto de récords futuros
+  es intrínsecamente ruidoso. Un R² de 0.118 es pequeño en absoluto, pero es la
+  diferencia entre un modelo que replica la media y uno que predice.
+
+---
+
+# CÓMO COMPROBAR TODO ESTO
+
+Los comandos se ejecutan desde la raíz del proyecto
+(`/home/estudiante/Documents/IAA/trading_view_clone`).
+
+## 1. Que nada se rompió (30 segundos)
+
+```bash
+perl -c -I. Market/Indicators/GhostSwings.pm
+perl -c -I. Market/Overlays/GhostSwings.pm
+perl -c -I. market.pl
+perl -c -I. ghost_dataset.pl
+perl -c -I. train_lstm_ghosts.pl
+```
+
+Los cinco deben decir `syntax OK`. Después, `perl market.pl` debe renderizar los
+rastros del fantasma igual que antes (la Fase 1 solo **añadió** claves al
+hashref; el overlay lee únicamente `price`/`ts`/`kind`).
+
+## 2. Que el dataset es reproducible y no se alteró lo anterior (~6 minutos)
+
+```bash
+cp dataset_ghosts_train.csv /tmp/ref_train.csv
+cp dataset_ghosts_test.csv  /tmp/ref_test.csv
+perl ghost_dataset.pl 2026_Abril-Junio.csv dataset_ghosts_train.csv
+perl ghost_dataset.pl 2026_07_24.csv       dataset_ghosts_test.csv
+diff /tmp/ref_train.csv dataset_ghosts_train.csv && echo "train reproducible"
+diff /tmp/ref_test.csv  dataset_ghosts_test.csv  && echo "test reproducible"
+```
+
+Debe salir **10422** filas en train y **3242** en test (más la cabecera), 100
+columnas, y los `diff` vacíos.
+
+Para comprobar que las **81 columnas originales** siguen intactas respecto al
+estado anterior al plan:
+
+```bash
+git show 4b3581a:dataset_ghosts_train.csv > /tmp/viejo_train.csv
+python3 -c "
+import csv
+v=list(csv.DictReader(open('/tmp/viejo_train.csv')))
+n=list(csv.DictReader(open('dataset_ghosts_train.csv')))
+cols=[c for c in v[0]]
+print('filas', len(v), len(n))
+print('columnas viejas con algun valor distinto:',
+      sum(1 for c in cols if any(a[c]!=b[c] for a,b in zip(v,n))))
+"
+```
+
+Debe imprimir `10422 10422` y **0** columnas distintas.
+
+## 3. Que no hay fuga de futuro
+
+Las tres garantías, verificables leyendo el código:
+
+- `Market/Indicators/GhostSwings.pm` — las claves añadidas en
+  `_update_live_tracking` se capturan **antes** de sobrescribir el récord y solo
+  contienen hechos ya ocurridos.
+- `ghost_dataset.pl` — `ghost_state_features` y `bar_context_features` solo
+  reciben `$idx` y leen índices `≤ $idx`; `pipeline_catch_up` sigue siendo el
+  único punto que decide hasta dónde ve cada temporalidad.
+- `train_lstm_ghosts.pl` — media/std de features **y** de targets se calculan
+  solo con `@train_rows` y se guardan en `lstm_norm_params.json`; el test las
+  reaplica sin recalcular.
+
+Comprobación empírica del último punto:
+
+```bash
+grep -n "compute_norm_params" train_lstm_ghosts.pl
+```
+
+Ambas llamadas deben recibir `\@train_rows`, nunca las filas de test.
+
+## 4. Que el modelo entrena y rinde lo documentado (~4 minutos)
+
+```bash
+perl train_lstm_ghosts.pl train
+perl train_lstm_ghosts.pl eval
+```
+
+Valores esperados (con `hidden=16`, `dropout=0.5`, `wd=0.01`, `SEQ_LEN=3`):
+
+- **`val_loss` de la mejor época: ~0.520-0.524.** Si sale ~2.1, los targets no
+  se están estandarizando (Fase 4 rota). Si sale ~0.56, la regularización se
+  cambió.
+- **Mejora sobre el baseline de la media (continuo):** ~+5% / +6.6% / +4.4% /
+  +3.4%. Hay ±0.3 pp de variación entre corridas por la inicialización.
+- **R² continuo:** positivo en los cuatro horizontes (~+0.118 / +0.081 / +0.062
+  / +0.054). **Si algún R² sale negativo, algo se rompió**: es la señal de que
+  el modelo volvió a replicar la media.
+- **±1 rastro:** ~87% a 3 minutos.
+
+## 5. Que el techo del dataset es el que se dice (opcional, ~2 minutos)
+
+Reconstruir la medición con ridge (script en scratchpad, efímero): entrenar una
+ridge sobre `dataset_ghosts_train.csv` estandarizando solo con train, evaluar en
+`dataset_ghosts_test.csv`, y comparar contra predecir la media de train. Debe
+dar ~+6.6 / +7.3 / +3.9 / +3.4 % de mejora de MAE. Ese es el techo lineal; el
+LSTM debe aterrizar cerca, no muy por encima (si lo supera con holgura, revisar
+que no haya fuga).
+
+## 6. Historial de commits
+
+```bash
+git log --oneline d1a90dd..HEAD
+```
+
+| Commit | Contenido |
+|---|---|
+| `4b3581a` | Fase 1 — estado del proceso de récords en cada rastro |
+| `6c4aa61` | Fase 2 — 19 features nuevas + CSV regenerados |
+| `b982aaa` | Fases 3 y 4 — normalización por ATR y targets estandarizados |
+| `5cff3ba` | Fase 5 — cierre sin cambios, hipótesis refutada |
+| (este) | Fase 6 — R², persistencia, exactitud ±1 |

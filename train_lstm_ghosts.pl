@@ -71,6 +71,10 @@ use constant {
 };
 
 my @TARGET_COLS = qw(target_3m target_5m target_10m target_15m);
+# Ventana en segundos de cada target, en el MISMO orden que @TARGET_COLS
+# (identicas a @WINDOWS_SEC de ghost_dataset.pl). Las usa el baseline de
+# persistencia en 'eval'.
+my @TARGET_WINDOWS = (180, 300, 600, 900);
 my @META_COLS   = qw(ts timestamp);
 # Estas nunca deberian venir vacias (siempre hay vela 1m con volumen/ATR) --
 # se usan tal cual, sin flag has_X.
@@ -292,6 +296,70 @@ sub mae_rmse {
     return ($sae / $n, sqrt($sse / $n));
 }
 
+# -----------------------------------------------------------------------------
+# r2: coeficiente de determinacion sobre el conjunto evaluado. Es la metrica
+# que delata si el modelo EXPLICA varianza o solo replica la media: un modelo
+# que predice siempre la media da R2 = 0, y uno peor que la media da R2 < 0.
+# Era exactamente el sintoma del estado previo al plan (R2 entre -0.01 y -0.11).
+# -----------------------------------------------------------------------------
+sub r2 {
+    my ($pred, $actual) = @_;
+    my $n = scalar @$actual;
+    my $mean = 0; $mean += $_ for @$actual; $mean /= $n;
+    my ($sse, $sst) = (0, 0);
+    for my $i (0 .. $n - 1) {
+        $sse += ( $pred->[$i]   - $actual->[$i] ) ** 2;
+        $sst += ( $actual->[$i] - $mean         ) ** 2;
+    }
+    return $sst > 0 ? 1 - $sse / $sst : 0;
+}
+
+# hit_rates: sobre la prediccion ENTERA, % de aciertos exactos y % dentro de
+# +-1 rastro. Es la metrica mas legible para la audiencia de la exposicion
+# ("acierta el numero exacto X de cada 100 veces, y se queda a un rastro o
+# menos Y de cada 100").
+sub hit_rates {
+    my ($pred, $actual) = @_;
+    my ($exact, $within1) = (0, 0);
+    for my $i (0 .. $#$actual) {
+        my $d = abs( $pred->[$i] - $actual->[$i] );
+        $exact++   if $d < 0.5;
+        $within1++ if $d < 1.5;
+    }
+    my $n = scalar @$actual;
+    return ( 100 * $exact / $n, 100 * $within1 / $n );
+}
+
+# -----------------------------------------------------------------------------
+# persistence_preds: baseline de PERSISTENCIA -- "los proximos W segundos se
+# pareceran a los W anteriores", o sea predecir el numero de rastros ocurridos
+# en (ts-W, ts].
+#
+# Es CAUSAL a proposito: solo cuenta rastros ya ocurridos en el momento de la
+# prediccion. Contrastar con la alternativa tentadora de "repetir la etiqueta
+# del rastro anterior", que NO seria un baseline valido: la ventana de esa
+# etiqueta se extiende hacia el futuro de ts, asi que estaria mirando datos que
+# todavia no existen.
+#
+# Puntero monotono ($lo nunca retrocede) -> O(n) en vez de O(n^2).
+#
+# LIMITACION conocida: para las primeras filas del archivo de test la ventana
+# hacia atras cae fuera del archivo (los rastros de junio no estan en el CSV de
+# test), asi que su conteo queda subestimado. Afecta como mucho a los rastros
+# de los primeros W segundos del fichero, despreciable sobre 3240 filas.
+# -----------------------------------------------------------------------------
+sub persistence_preds {
+    my ($rows, $window_sec, $start_idx) = @_;
+    my @ts = map { $_->{ts} } @$rows;
+    my (@out, $lo);
+    $lo = 0;
+    for my $i (0 .. $#ts) {
+        $lo++ while $lo < $i && $ts[$lo] <= $ts[$i] - $window_sec;
+        push @out, $i - $lo;   # rastros en (ts-W, ts], sin contar el propio $i
+    }
+    return [ @out[ $start_idx .. $#out ] ];
+}
+
 # =============================================================================
 # MODO train
 # =============================================================================
@@ -491,6 +559,35 @@ if ($mode eq 'eval') {
         printf "  %-12s MAE=%.3f RMSE=%.3f      MAE=%.3f RMSE=%.3f      MAE=%.3f RMSE=%.3f      (mejora: continuo %.1f%%, entero %.1f%%)\n",
             $col, $mae, $rmse, $imae, $irmse, $bmae, $brmse, $imp, $iimp;
     }
+
+    # -------------------------------------------------------------------------
+    # Metricas adicionales para la exposicion:
+    #   - R2: distingue "explica varianza" de "replica la media" (R2 ~ 0). Es
+    #     la metrica que delataba el estado previo al plan de mejora.
+    #   - Segundo baseline (persistencia), porque batir a la media no basta:
+    #     hay que batir tambien a la extrapolacion ingenua del pasado reciente.
+    #   - Exacto / +-1 rastro: lo mas legible para la audiencia.
+    # -------------------------------------------------------------------------
+    print "\n=== Metricas adicionales ===\n";
+    printf "  %-12s %-10s %-10s %-9s %-11s %s\n",
+        '', 'R2 cont.', 'R2 entero', 'exacto', '+-1 rastro', 'Baseline persistencia';
+    for my $k (0 .. $#TARGET_COLS) {
+        my $col = $TARGET_COLS[$k];
+        my $r2c = r2($pred_by_target[$k], $actual_by_target[$k]);
+        my $r2i = r2($int_by_target[$k],  $actual_by_target[$k]);
+        my ($exact, $within1) = hit_rates($int_by_target[$k], $actual_by_target[$k]);
+
+        my $persist = persistence_preds($rows, $TARGET_WINDOWS[$k], SEQ_LEN - 1);
+        my ($pmae)  = mae_rmse($persist, $actual_by_target[$k]);
+        my ($mae)   = mae_rmse($pred_by_target[$k], $actual_by_target[$k]);
+        my $pimp    = ($pmae > 0) ? (1 - $mae / $pmae) * 100 : 0;
+
+        printf "  %-12s %+9.3f %+9.3f %8.1f%% %10.1f%%     MAE=%.3f (LSTM mejora %.1f%%)\n",
+            $col, $r2c, $r2i, $exact, $within1, $pmae, $pimp;
+    }
+    print "\n  R2 = 0 equivale a predecir siempre la media; R2 < 0 es peor que la media.\n";
+    print "  Persistencia = predecir los rastros de la ventana ANTERIOR de la misma\n";
+    print "  duracion (causal: solo cuenta rastros ya ocurridos).\n";
 
     print "\nPredicciones guardadas en ", PRED_FILE, "\n";
 }
