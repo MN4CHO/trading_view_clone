@@ -73,7 +73,12 @@ sub new {
         _track_price => undef,
         _track_index => undef,
 
-        _traces => [],   # eventos de rastro/reubicacion: {index, ts, price, kind}
+        # Cuantos rastros se han emitido en la PIERNA actual (desde el ultimo
+        # pivote confirmado). Se expone en cada rastro como n_in_leg -- ver
+        # nota de ESTADO EXPUESTO en _update_live_tracking.
+        _leg_trace_count => 0,
+
+        _traces => [],   # eventos de rastro/reubicacion: ver _update_live_tracking
 
         _market_data => undef,   # referencia para que el overlay resuelva ts->indice
     };
@@ -92,6 +97,7 @@ sub reset {
     $self->{_track_kind}  = undef;
     $self->{_track_price} = undef;
     $self->{_track_index} = undef;
+    $self->{_leg_trace_count} = 0;
     $self->{_traces} = [];
 }
 
@@ -208,6 +214,7 @@ sub _reset_tracking {
     $self->{_track_kind}  = ($kind eq 'H') ? 'L' : 'H';
     $self->{_track_price} = undef;
     $self->{_track_index} = undef;
+    $self->{_leg_trace_count} = 0;   # empieza una pierna nueva
 }
 
 # -----------------------------------------------------------------------------
@@ -236,12 +243,38 @@ sub _update_live_tracking {
 
     return unless $moved;
 
+    # --- ESTADO EXPUESTO (para el extractor de features del modelo) ---
+    # Un rastro es "se batio el record del extremo trackeado". El estado que
+    # describe ESE proceso de records (donde estaba el record anterior, cuanto
+    # aguanto, cuantos van en la pierna) no se puede reconstruir desde fuera a
+    # partir de {index, ts, price, kind}, asi que se adjunta aqui. Se captura
+    # ANTES de sobrescribir _track_price/_track_index, que es justo lo que
+    # convierte estos campos en informacion util:
+    #   prev_price  -- valor del record que se acaba de batir (undef en la
+    #                  primera vela de la pierna: el fantasma "aparece", no
+    #                  bate nada).
+    #   prev_index  -- vela donde se habia fijado ese record ($i - prev_index
+    #                  = cuantas velas aguanto).
+    #   pivot_*     -- pivote confirmado que ancla la pierna actual.
+    #   n_in_leg    -- rastros YA emitidos en esta pierna (0 para el primero).
+    # Solo son hechos ya ocurridos: no rompen la garantia de no-fuga-de-futuro
+    # de la cabecera. Son claves ADICIONALES -- los consumidores existentes
+    # (Overlays::GhostSwings) leen unicamente price/ts/kind y no iteran claves.
+    my $prev_price = $self->{_track_price};
+    my $prev_index = $self->{_track_index};
+
     $self->{_track_price} = $candidate_price;
     $self->{_track_index} = $i;
 
     push @{ $self->{_traces} }, {
         index => $i, ts => $c->{ts}, price => $candidate_price, kind => $kind,
+        prev_price  => $prev_price,
+        prev_index  => $prev_index,
+        pivot_index => $self->{_last_pivot}{index},
+        pivot_price => $self->{_last_pivot}{price},
+        n_in_leg    => $self->{_leg_trace_count},
     };
+    $self->{_leg_trace_count}++;
 }
 
 1;
