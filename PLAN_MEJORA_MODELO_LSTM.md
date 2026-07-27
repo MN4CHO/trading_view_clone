@@ -16,7 +16,7 @@
 |---|---|---|
 | 0 | Diagnóstico y medición del techo del dataset | ✅ Completada |
 | 1 | Exponer el estado del fantasma en `GhostSwings.pm` | ✅ Completada |
-| 2 | Nuevas columnas en `ghost_dataset.pl` (+ regenerar CSV) | ⬜ Pendiente |
+| 2 | Nuevas columnas en `ghost_dataset.pl` (+ regenerar CSV) | ✅ Completada |
 | 3 | Normalizar distancias por ATR en el entrenamiento | ⬜ Pendiente |
 | 4 | Loss y salida correctas para conteos | ⬜ Pendiente |
 | 5 | Re-sintonizar la regularización | ⬜ Pendiente |
@@ -212,8 +212,8 @@ en ese caso, tal como se midió en la Fase 0).
 
 ## FASE 2 — Nuevas columnas en el extractor
 
-**Estado:** ⬜ Pendiente
-**Archivo:** `ghost_dataset.pl`
+**Estado:** ✅ Completada (2026-07-26)
+**Archivos:** `ghost_dataset.pl`, `dataset_ghosts_train.csv`, `dataset_ghosts_test.csv`
 
 ### Cambios
 
@@ -260,7 +260,76 @@ detección y hay que parar.
 
 ### Log
 
-_(pendiente)_
+**Implementado con 3 desviaciones respecto al plan, todas documentadas abajo.**
+Resultado: **19 columnas nuevas** (no 17), CSV de **100 columnas** (antes 81).
+
+Cambios en `ghost_dataset.pl`:
+
+1. Helper `atr_ratio` (junto a `to_pip`) — devuelve `undef` si no hay ATR aún
+   (warm-up), que se exporta vacío y el flag `has_` del entrenamiento marca
+   como "no había dato".
+2. `ghost_state_features($tr, $c, $idx, $atr_pip)` — 11 columnas de estado del
+   proceso de récords, todas desde el rastro enriquecido de la Fase 1.
+3. `bar_context_features($arr, $idx, $atr_pip)` — 8 columnas de volatilidad
+   realizada y forma de la vela, ventanas inclusivas `[idx-N, idx]`.
+4. `$arr_1m = $market->get_data->{'1m'}` cacheado tras el cálculo de los
+   rastros; `@ghost_cols` / `@bar_cols` insertadas en `@header` después de
+   `dist_weekly`, dejando los `target_*` al final.
+
+#### Desviaciones respecto al plan
+
+- **`ghost_broke` se desdobló en dos features (de ahí 19 y no 17).** El plan
+  definía `ghost_broke` = \|`price` − `prev_price`\| (por cuánto se batió el
+  récord), pero lo que realmente se **midió** en la Fase 0 fue
+  \|`prev_price` − `close`\| (dónde quedó el récord anterior respecto al cierre).
+  Son cosas distintas y solo la segunda estaba validada, así que se exportan las
+  dos: `ghost_broke`/`ghost_broke_atr` (definición del plan) y
+  `ghost_gap_prev`/`ghost_gap_prev_atr` (la medida validada). Coste: 2 columnas
+  de 100, dilución despreciable.
+- **Sin sumas acumuladas para las `rvol`.** El plan las pedía para evitar
+  O(N·30), pero N son las **filas** (10422), no las velas (88736): el bucle
+  directo son ~940k operaciones aritméticas, ruido frente a los 3 pipelines de
+  SMC/Liquidez/ZigZag que dominan el tiempo. Se dejó el bucle simple, que es
+  menos código y menos superficie de bug. Confirmado: la corrida completa tarda
+  **192 s** (train) y **145 s** (test), en línea con lo que ya tardaba.
+- **`ghost_bars_since_pivot` tiene mínimo 50, no 0**, porque `pivot_index` es el
+  índice del *candidato* `c = i − length` y el pivote se confirma 50 velas
+  después. Es correcto y esperado, no un bug.
+
+#### Verificación (script `verify_f2.py` en el scratchpad)
+
+Se generó primero a scratchpad y solo se promovieron los CSV **después** de
+pasar todo:
+
+| Comprobación | train | test |
+|---|---|---|
+| Filas | **10422** ✅ | **3242** ✅ |
+| Columnas viejas ausentes | 0 | 0 |
+| Columnas viejas con algún valor distinto | **0** | **0** |
+| Columnas nuevas presentes / vacías | 19/19, 0.0% | 19/19, 0.0% |
+
+Las 81 columnas originales (`ts`, `timestamp`, los 4 `target_*` y las 75 del
+PDF) salieron **byte a byte idénticas** a las anteriores: la Fase 1 no alteró la
+detección y el extractor no cambió nada de lo que ya funcionaba.
+
+#### Señal medida sobre los CSV nuevos (ridge, train=abril-junio → test=julio)
+
+| Conjunto | 3m | 5m | 10m | 15m |
+|---|---|---|---|---|
+| A) 75 del PDF, PIP crudo (estado previo) | +3.4% / R² −0.057 | +1.0% / −0.091 | −0.2% / −0.068 | −0.7% / −0.076 |
+| B) 75 del PDF norm-ATR (anticipo Fase 3) | +3.4% / −0.057 | +3.0% / −0.027 | +0.8% / −0.009 | +1.1% / −0.006 |
+| C) solo las 19 nuevas | +6.3% / **+0.133** | +7.6% / +0.094 | +4.3% / +0.050 | +2.8% / +0.032 |
+| **D) 75 norm-ATR + 19 nuevas** | **+6.6% / +0.132** | **+7.3% / +0.092** | **+3.9% / +0.060** | **+3.4% / +0.049** |
+
+**Todos los criterios de aceptación se cumplen** y reproducen las predicciones
+de la Fase 0 casi exactamente (D vs. objetivo: 6.6 ≥ 6, 7.3 ≥ 7, 3.9 ≥ 3.5,
+3.4 ≥ 3; R² 0.132 ≥ 0.12, 0.092 ≥ 0.09, 0.060 ≥ 0.04, 0.049 ≥ 0.02).
+
+**Hallazgo para la Fase 4:** el redondeo a entero ≥0 mejora el MAE
+(+7.8% / +10.0% / +4.4% / +3.5%) pero **hunde el R²** en el horizonte corto
+(3m: 0.132 → **0.005**). O sea que redondear no es gratis: optimiza MAE a costa
+del error cuadrático. En la Fase 4 hay que **reportar las dos versiones** y no
+dejar la redondeada como única salida.
 
 ---
 

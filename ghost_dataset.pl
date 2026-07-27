@@ -156,6 +156,10 @@ for my $i (0 .. $market->size - 1) {
 my $all_traces = $ghost_1m->get_traces;
 printf "Rastros totales detectados: %d\n", scalar(@$all_traces);
 
+# Array crudo de 1m (contexto + entrada), indexado igual que $tr->{index} de
+# cada rastro -- lo usa bar_context_features para las ventanas de volatilidad.
+my $arr_1m = $market->get_data->{'1m'};
+
 # =============================================================================
 # 3. PIPELINES por temporalidad: cada una es un MarketData INDEPENDIENTE
 #    (misma fuente de 1m, pero cada objeto fija su propia $tf activa) mas su
@@ -256,6 +260,119 @@ my $daily_levels = Market::Indicators::DailyLevels->new;
 #    el "espesor" para zonas, y todo ya convertido a PIP).
 # =============================================================================
 sub to_pip { my ($d) = @_; return defined($d) ? $d / PIP_SIZE : undef; }
+
+# atr_ratio: convierte una distancia YA en PIP a "cuantos ATR de 1m es". Hace
+# la feature comparable entre regimenes de volatilidad: 200 pip no significan
+# lo mismo en un dia tranquilo que en uno agitado. undef si no hay ATR todavia
+# (warm-up de las primeras velas) -- se exporta vacio y el flag has_ del script
+# de entrenamiento lo marca como "no habia dato".
+sub atr_ratio {
+    my ($pip, $atr_pip) = @_;
+    return undef unless defined($pip) && defined($atr_pip) && $atr_pip > 0;
+    return $pip / $atr_pip;
+}
+
+# -----------------------------------------------------------------------------
+# ghost_state_features: describe el PROCESO DE RECORDS del que cada rastro es
+# un evento (ver el bloque "ESTADO EXPUESTO" en Indicators::GhostSwings). Un
+# rastro es "se batio el extremo trackeado desde el ultimo pivote", asi que lo
+# que informa sobre cuantos rastros vienen despues es el estado de ese proceso:
+# donde quedo el cierre respecto al record nuevo, por cuanto se batio el
+# anterior, cuanto aguanto, y cuantos records van en la pierna.
+#
+# Todo sale de hechos YA OCURRIDOS ($tr y la vela $c del propio rastro): no hay
+# fuga de futuro, igual que el resto del extractor.
+#
+# APERTURA DE PIERNA: el fantasma "aparece" sin batir nada, y ahi prev_price /
+# prev_index son undef a proposito (1100 de los 10422 rastros del train). En
+# ese caso broke/gap/prev_age valen 0 = "no habia record previo que batir",
+# que es un valor con significado real, no un dato faltante.
+# -----------------------------------------------------------------------------
+sub ghost_state_features {
+    my ($tr, $c, $idx, $atr_pip) = @_;
+    my %f;
+
+    $f{ghost_track_kind} = ( $tr->{kind} eq 'H' ) ? 1 : -1;
+
+    # Distancia del cierre al record que se acaba de fijar. Es la feature mas
+    # predictiva del dataset (corr -0.22 con target_15m): si el precio quedo
+    # lejos del extremo que acaba de marcar, vienen MENOS records despues.
+    my $wick = to_pip( abs( $tr->{price} - $c->{close} ) );
+    $f{ghost_wick}     = $wick;
+    $f{ghost_wick_atr} = atr_ratio($wick, $atr_pip);
+
+    # Por cuanto se batio el record anterior (fuerza de la expansion).
+    my $broke = defined $tr->{prev_price}
+        ? to_pip( abs( $tr->{price} - $tr->{prev_price} ) ) : 0;
+    $f{ghost_broke}     = $broke;
+    $f{ghost_broke_atr} = atr_ratio($broke, $atr_pip);
+
+    # Donde habia quedado el record ANTERIOR respecto al cierre actual.
+    my $gap = defined $tr->{prev_price}
+        ? to_pip( abs( $tr->{prev_price} - $c->{close} ) ) : 0;
+    $f{ghost_gap_prev}     = $gap;
+    $f{ghost_gap_prev_atr} = atr_ratio($gap, $atr_pip);
+
+    # Cuantas velas aguanto el record anterior: en un proceso de records, mas
+    # antiguedad del record = menos probable batirlo.
+    $f{ghost_prev_age} = defined $tr->{prev_index} ? $idx - $tr->{prev_index} : 0;
+
+    # Profundidad en la pierna actual. OJO: se usan pivot_index/n_in_leg tal
+    # como los expone el rastro y NO se deduce la pierna comparando kind entre
+    # rastros consecutivos -- dos piernas seguidas PUEDEN compartir kind
+    # (verificado: rastro idx=44251 kind=H con pivote 44156, y el siguiente
+    # idx=44265 kind=H con pivote 44215).
+    $f{ghost_bars_since_pivot} = $idx - $tr->{pivot_index};
+    $f{ghost_n_in_leg}         = $tr->{n_in_leg};
+    $f{ghost_leg_extent_atr}   = atr_ratio(
+        to_pip( abs( $tr->{price} - $tr->{pivot_price} ) ), $atr_pip );
+
+    return \%f;
+}
+
+# -----------------------------------------------------------------------------
+# bar_context_features: volatilidad realizada y forma de la vela del rastro,
+# sobre las ultimas N velas de 1m hasta $idx (nunca mas alla -> sin fuga de
+# futuro). Ventanas inclusivas [idx-N, idx].
+# -----------------------------------------------------------------------------
+sub bar_context_features {
+    my ($arr, $idx, $atr_pip) = @_;
+    my %f;
+    my $c = $arr->[$idx];
+
+    # Desviacion tipica (poblacional) de los cierres en 3 horizontes.
+    for my $n (5, 15, 30) {
+        my $lo = $idx - $n; $lo = 0 if $lo < 0;
+        my ($sum, $cnt) = (0, 0);
+        for my $j ($lo .. $idx) { $sum += $arr->[$j]{close}; $cnt++; }
+        my $mean = $sum / $cnt;
+        my $sq = 0;
+        $sq += ( $arr->[$_]{close} - $mean ) ** 2 for $lo .. $idx;
+        $f{"rvol$n"} = to_pip( sqrt( $sq / $cnt ) );
+    }
+
+    # Rango de las ultimas 15 velas (expansion/contraccion del rango).
+    my $lo15 = $idx - 14; $lo15 = 0 if $lo15 < 0;
+    my ($hi, $low) = ( $arr->[$lo15]{high}, $arr->[$lo15]{low} );
+    for my $j ($lo15 .. $idx) {
+        $hi  = $arr->[$j]{high} if $arr->[$j]{high} > $hi;
+        $low = $arr->[$j]{low}  if $arr->[$j]{low}  < $low;
+    }
+    $f{rng15}     = to_pip( $hi - $low );
+    $f{rng15_atr} = atr_ratio( $f{rng15}, $atr_pip );
+
+    $f{body_atr}    = atr_ratio( to_pip( abs( $c->{close} - $c->{open} ) ), $atr_pip );
+    $f{bar_rng_atr} = atr_ratio( to_pip( $c->{high} - $c->{low} ), $atr_pip );
+
+    # Volumen relativo a su propia media de 20 velas.
+    my $lo20 = $idx - 20; $lo20 = 0 if $lo20 < 0;
+    my ($vsum, $vcnt) = (0, 0);
+    for my $j ($lo20 .. $idx) { $vsum += $arr->[$j]{volume} // 0; $vcnt++; }
+    my $vmean = $vsum / $vcnt;
+    $f{vol_rel20} = $vmean > 0 ? ( ( $c->{volume} // 0 ) / $vmean ) : undef;
+
+    return \%f;
+}
 
 # ts_to_idx: mismo criterio de busqueda binaria que Overlays::ZigZag/Fibonacci
 # (_ts_to_active_idx), duplicado aqui a proposito -- mismo patron ya
@@ -546,7 +663,23 @@ my @tf_cols = qw(
     dist_fib dist_vwap vwap_band1_width dist_poc dist_vah dist_val
     dist_supply thick_supply dist_demand thick_demand
 );
+# Estado del proceso de records del fantasma (ghost_state_features) y contexto
+# de volatilidad/forma de la vela (bar_context_features). Son las columnas
+# "adicionales" que autoriza el PDF ("A anadir columnas con informacion
+# adicional como ATR de 1 minuto, volumen de 1 minuto, EMA(9) del volumen,
+# etc."); ninguna usa fecha/hora/minuto, que el PDF reserva como metadato de
+# validacion y prohibe para entrenar.
+my @ghost_cols = qw(
+    ghost_track_kind ghost_wick ghost_wick_atr ghost_broke ghost_broke_atr
+    ghost_gap_prev ghost_gap_prev_atr ghost_prev_age ghost_bars_since_pivot
+    ghost_n_in_leg ghost_leg_extent_atr
+);
+my @bar_cols = qw(
+    rvol5 rvol15 rvol30 rng15 rng15_atr body_atr bar_rng_atr vol_rel20
+);
+
 my @header = qw(ts timestamp atr_1m volume_1m ema9_volume_1m dist_daily dist_4h dist_weekly);
+push @header, @ghost_cols, @bar_cols;
 for my $tf (qw(1m 10m 1h)) {
     push @header, "tf${tf}_$_" for @tf_cols;
 }
@@ -604,6 +737,13 @@ for my $k (0 .. $#$all_traces) {
         dist_daily => $dist_daily // '', dist_4h => $dist_4h // '',
         dist_weekly => $dist_weekly // '',
     );
+    # --- Estado del fantasma + contexto de la vela (columnas adicionales) ---
+    my $atr_pip = defined($atr_val_1m) ? to_pip($atr_val_1m) : undef;
+    my $gf = ghost_state_features($tr, $c, $idx, $atr_pip);
+    my $bf = bar_context_features($arr_1m, $idx, $atr_pip);
+    @row{ @ghost_cols } = @{$gf}{ @ghost_cols };
+    @row{ @bar_cols }   = @{$bf}{ @bar_cols };
+
     for my $tf (qw(1m 10m 1h)) {
         my $feat = extract_tf_features($PL{$tf}, $avg_price, $PL{$tf}{cursor});
         $row{"tf${tf}_$_"} = $feat->{$_} for @tf_cols;
