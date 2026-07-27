@@ -48,13 +48,14 @@ use constant {
     MODEL_FILE   => 'lstm_ghosts.params',
     NORM_FILE    => 'lstm_norm_params.json',
     PRED_FILE    => 'lstm_ghosts_predictions.csv',
-    SEQ_LEN      => 5,
-    HIDDEN_UNITS => 32,
+    SEQ_LEN      => 3,      # antes 5 -- menos parametros de entrada por muestra
+    HIDDEN_UNITS => 16,     # antes 32 -- menos capacidad para memorizar ruido
     NUM_EPOCHS   => 60,
     BATCH_SIZE   => 64,
     LEARN_RATE   => 0.001,
-    VAL_FRAC     => 0.1,   # ultimo 10% de train (cronologico) para validacion
-    PATIENCE     => 10,    # early stopping: epocas sin mejorar val_loss antes de parar
+    VAL_FRAC     => 0.1,
+    PATIENCE     => 10,
+    WEIGHT_DECAY => 0.01,   # regularizacion L2 -- nueva
 };
 
 my @TARGET_COLS = qw(target_3m target_5m target_10m target_15m);
@@ -160,10 +161,11 @@ sub standardize_rows {
 }
 
 sub save_norm_params {
-    my ($path, $feature_cols, $mean, $std) = @_;
+    my ($path, $feature_cols, $mean, $std, $target_mean) = @_;
     open my $fh, '>', $path or die "No pude escribir '$path': $!\n";
     print $fh JSON::PP->new->canonical->pretty->encode({
         feature_cols => $feature_cols, mean => $mean, std => $std,
+        target_mean => $target_mean,
     });
     close $fh;
 }
@@ -174,7 +176,7 @@ sub load_norm_params {
     local $/;
     my $data = JSON::PP->new->decode(<$fh>);
     close $fh;
-    return ($data->{feature_cols}, $data->{mean}, $data->{std});
+    return ($data->{feature_cols}, $data->{mean}, $data->{std}, $data->{target_mean});
 }
 
 # =============================================================================
@@ -216,7 +218,7 @@ package LSTMGhosts {
         # curso, aunque alli lo aplica dentro del LSTM (solo tiene efecto con
         # num_layers>1). Aqui se aplica explicitamente como capa aparte,
         # correcta para 1 sola capa de LSTM.
-        $self->{drop}  = mx->gluon->nn->Dropout(0.2);
+        $self->{drop}  = mx->gluon->nn->Dropout(0.5);   # antes 0.2 -- mas regularizacion
         $self->{dense} = mx->gluon->nn->Dense(units => $args{units}, flatten => 0);
         $self->register_child($self->{$_}) for ('lstm', 'drop', 'dense');
         return bless($self, $class);
@@ -264,7 +266,17 @@ if ($mode eq 'train') {
         scalar(@$rows), scalar(@train_rows), scalar(@val_rows), scalar(@$feature_cols);
 
     my ($mean, $std) = compute_norm_params(\@train_rows, $feature_cols);
-    save_norm_params(NORM_FILE, $feature_cols, $mean, $std);
+
+    # Baseline ingenuo (para contextualizar el MAE/RMSE del LSTM en 'eval'):
+    # promedio de cada target, calculado SOLO con train -- mismo principio
+    # que la estandarizacion de features, sin fuga de test.
+    my %target_mean;
+    for my $col (@TARGET_COLS) {
+        my $sum = 0; $sum += $_->{$col} for @train_rows;
+        $target_mean{$col} = $sum / scalar(@train_rows);
+    }
+
+    save_norm_params(NORM_FILE, $feature_cols, $mean, $std, \%target_mean);
     standardize_rows(\@train_rows, $feature_cols, $mean, $std);
     standardize_rows(\@val_rows,   $feature_cols, $mean, $std);
     print "Parametros de normalizacion guardados en ", NORM_FILE, "\n";
@@ -288,7 +300,8 @@ if ($mode eq 'train') {
 
     my $loss    = mx->gluon->loss->L2Loss();
     my $trainer = mx->gluon->Trainer($net->collect_params(),
-        optimizer => 'adam', optimizer_params => { learning_rate => LEARN_RATE });
+        optimizer => 'adam',
+        optimizer_params => { learning_rate => LEARN_RATE, wd => WEIGHT_DECAY });
 
     # Early stopping por val_loss: el train_loss baja monotonamente (se ve en
     # los logs) pero el val_loss empieza a SUBIR despues de pocas epocas
@@ -353,7 +366,7 @@ if ($mode eq 'eval') {
     my $dist_cols = dist_cols_from_header($header);
     impute_rows($rows, $dist_cols);
 
-    my ($feature_cols, $mean, $std) = load_norm_params(NORM_FILE);
+    my ($feature_cols, $mean, $std, $target_mean) = load_norm_params(NORM_FILE);
     standardize_rows($rows, $feature_cols, $mean, $std);
 
     my ($X_test, $Y_test) = make_sequences($rows, $feature_cols, SEQ_LEN);
@@ -384,9 +397,20 @@ if ($mode eq 'eval') {
     close $out;
 
     print "\n=== Comparacion vs etiquetado automatico (target_*) ===\n";
+    printf "  %-12s %-22s %-22s\n", '', 'LSTM', 'Baseline (promedio train)';
     for my $k (0 .. $#TARGET_COLS) {
+        my $col = $TARGET_COLS[$k];
         my ($mae, $rmse) = mae_rmse($pred_by_target[$k], $actual_by_target[$k]);
-        printf "  %-12s MAE=%.3f  RMSE=%.3f\n", $TARGET_COLS[$k], $mae, $rmse;
+
+        # Baseline: predecir SIEMPRE el promedio de train para ese target.
+        my $bmean = $target_mean->{$col};
+        my @baseline_pred = ($bmean) x scalar(@{ $actual_by_target[$k] });
+        my ($bmae, $brmse) = mae_rmse(\@baseline_pred, $actual_by_target[$k]);
+
+        my $improvement = ($bmae > 0) ? (1 - $mae/$bmae) * 100 : 0;
+        printf "  %-12s MAE=%.3f RMSE=%.3f     MAE=%.3f RMSE=%.3f     (LSTM mejora %.1f%%)\n",
+            $col, $mae, $rmse, $bmae, $brmse, $improvement;
     }
+
     print "\nPredicciones guardadas en ", PRED_FILE, "\n";
 }
