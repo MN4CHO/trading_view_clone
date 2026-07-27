@@ -17,9 +17,9 @@
 | 0 | Diagnóstico y medición del techo del dataset | ✅ Completada |
 | 1 | Exponer el estado del fantasma en `GhostSwings.pm` | ✅ Completada |
 | 2 | Nuevas columnas en `ghost_dataset.pl` (+ regenerar CSV) | ✅ Completada |
-| 3 | Normalizar distancias por ATR en el entrenamiento | ⬜ Pendiente |
-| 4 | Loss y salida correctas para conteos | ⬜ Pendiente |
-| 5 | Re-sintonizar la regularización | ⬜ Pendiente |
+| 3 | Normalizar distancias por ATR en el entrenamiento | ✅ Completada |
+| 4 | Loss y salida correctas para conteos | ✅ Completada |
+| 5 | Re-sintonizar la regularización | 🔄 En curso (hipótesis refutada, verificando) |
 | 6 | Métricas defendibles para la exposición | ⬜ Pendiente |
 
 ---
@@ -335,7 +335,7 @@ dejar la redondeada como única salida.
 
 ## FASE 3 — Normalizar las distancias por ATR en el entrenamiento
 
-**Estado:** ⬜ Pendiente
+**Estado:** ✅ Completada (2026-07-26)
 **Archivo:** `train_lstm_ghosts.pl`, en `impute_rows`
 
 ### Cambios
@@ -356,13 +356,45 @@ Convierte features que hoy **dañan** (−3.4% en `target_15m`) en neutras-posit
 
 ### Log
 
-_(pendiente)_
+**Implementado como estaba planeado.** Cambios en `train_lstm_ghosts.pl`:
+
+1. Constante `PIP_SIZE => 0.25` (mismo valor que `ghost_dataset.pl`).
+2. `is_atr_scaled($col)` — devuelve cierto para `/^(?:dist_|tf)/`, es decir
+   `dist_daily`/`dist_4h`/`dist_weekly` y todo el bloque `tf1m_`/`tf10m_`/`tf1h_`
+   (incluye `dist_*`, `thick_*` y `vwap_band1_width`). Las 19 columnas de la
+   Fase 2 **no** entran: las que lo necesitan ya traen su propia variante `_atr`
+   calculada en el extractor.
+3. En `impute_rows`, división por el ATR de 1m de la propia fila, después de
+   fijar el flag `has_` y antes de estandarizar.
+
+#### Desviación respecto al plan
+
+Se divide por el ATR **expresado en PIP** (`atr_1m / PIP_SIZE`), no por la
+columna `atr_1m` cruda como en la medición de la Fase 0 (la columna viene en
+unidades de precio y las distancias en PIP). La diferencia es un **factor
+constante 1/0.25 por columna**, que la estandarización posterior absorbe
+exactamente: los inputs estandarizados son idénticos. Se eligió la versión con
+unidades coherentes para que el cociente signifique de verdad "cuántos ATR es
+esta distancia" y no despiste a quien lea el código.
+
+#### Resultado medido (LSTM real, no proxy)
+
+Se corrió train+eval **antes** y **después** del cambio, con los mismos CSV de
+la Fase 2, para aislar el efecto:
+
+| | val_loss | 3m | 5m | 10m | 15m |
+|---|---|---|---|---|---|
+| Fases 1-2 (sin norm-ATR) | 2.1630 (época 12) | +3.2% | +4.6% | +2.6% | +1.3% |
+| **+ Fase 3** | **2.0938 (época 6)** | **+3.9%** | **+4.9%** | **+3.8%** | **+2.6%** |
+
+Mejora en los cuatro horizontes. El `val_loss` es comparable entre estas dos
+corridas porque en ambas los targets están todavía sin estandarizar.
 
 ---
 
 ## FASE 4 — Loss y salida correctas para conteos
 
-**Estado:** ⬜ Pendiente
+**Estado:** ✅ Completada (2026-07-26)
 **Archivo:** `train_lstm_ghosts.pl`
 
 ### Cambios
@@ -380,7 +412,52 @@ _(pendiente)_
 
 ### Log
 
-_(pendiente)_
+**Implementado como estaba planeado.** Cambios en `train_lstm_ghosts.pl`:
+
+1. `compute_norm_params` se reutiliza sobre `@TARGET_COLS` para obtener
+   `target_mean` / `target_std` solo con train; ambos se guardan en
+   `lstm_norm_params.json` (`save_norm_params` / `load_norm_params` ampliadas).
+   `target_mean` cumple **dos papeles a la vez**: media de estandarización y
+   baseline ingenuo. Consecuencia elegante: una predicción estandarizada de 0
+   equivale exactamente al baseline.
+2. `standardize_rows` se aplica también a los targets de train y val. Los
+   targets de **test se dejan en unidades originales**; lo que se
+   des-estandariza es la salida del modelo.
+3. `eval` des-estandariza (`pred * target_std + target_mean`) y produce dos
+   salidas: continua y recortada-a-≥0-redondeada. El CSV de predicciones ahora
+   trae `pred_*`, `predint_*` y el etiquetado automático.
+
+**Ojo con el `val_loss`:** desde esta fase está en unidades de σ², así que
+**no es comparable** con las corridas anteriores a la Fase 4. Solo compara
+corridas post-F4 entre sí.
+
+#### Resultado medido
+
+| | val_loss | 3m | 5m | 10m | 15m |
+|---|---|---|---|---|---|
+| Fase 3 | (escala vieja) | +3.9% | +4.9% | +3.8% | +2.6% |
+| **+ Fase 4, salida continua** | **0.5203 (época 13)** | **+5.0%** | **+6.6%** | **+4.4%** | **+3.4%** |
+| + Fase 4, salida entera ≥0 | (misma corrida) | +6.8% | +8.7% | +4.9% | +3.3% |
+
+La salida continua **alcanza el techo lineal** que había medido con ridge en la
+Fase 2 (+6.6 / +7.3 / +3.9 / +3.4), o sea que el LSTM ya extrae toda la señal
+que el dataset tiene disponible de forma lineal.
+
+#### El compromiso del redondeo, confirmado en el modelo real
+
+Lo que la Fase 2 anticipó con ridge se reproduce en el LSTM: redondear **mejora
+el MAE pero empeora el RMSE**.
+
+| target_3m | MAE | RMSE |
+|---|---|---|
+| LSTM continuo | 0.829 | **0.976** |
+| LSTM entero ≥0 | **0.813** | 1.034 |
+| Baseline (media) | 0.872 | 1.045 |
+
+Nótese que la versión **entera empeora el RMSE hasta casi el nivel del
+baseline** (1.034 vs 1.045) aunque su MAE sea el mejor de los tres. Por eso el
+script reporta y guarda **las dos** y no sustituye una por otra: cuál usar
+depende de si al presentar se penaliza el error medio o el error grande.
 
 ---
 

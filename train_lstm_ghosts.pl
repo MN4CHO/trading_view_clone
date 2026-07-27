@@ -11,6 +11,17 @@
 # (softmax, 2 clases) a REGRESION multi-salida (4 targets numericos, salida
 # lineal + L2Loss).
 #
+# ADEMAS (Fases 3 y 4 del plan de mejora, ver PLAN_MEJORA_MODELO_LSTM.md):
+#   - Las distancias del PDF se dividen por el ATR de 1m de su propia fila
+#     antes de estandarizar (ver is_atr_scaled): en PIP absolutos no son
+#     comparables entre regimenes de volatilidad y llegaban a empeorar el MAE
+#     respecto a predecir la media.
+#   - Los 4 targets se estandarizan para entrenar y la salida se
+#     des-estandariza en 'eval', para que L2Loss no reparta el gradiente segun
+#     la varianza de cada horizonte (target_15m pesaba ~7x que target_3m).
+#   - 'eval' reporta la salida continua Y la version recortada a >=0 y
+#     redondeada, porque el redondeo mejora el MAE pero empeora el RMSE.
+#
 # DESVIACION DELIBERADA de la referencia: la referencia estandariza con
 # media/std de train+test COMBINADOS (fuga de test hacia el scaler). Aqui la
 # media/std se calculan SOLO con train y se guardan en NORM_FILE para
@@ -56,6 +67,7 @@ use constant {
     VAL_FRAC     => 0.1,
     PATIENCE     => 10,
     WEIGHT_DECAY => 0.01,   # regularizacion L2 -- nueva
+    PIP_SIZE     => 0.25,   # tick de NQ1!, mismo valor que en ghost_dataset.pl
 };
 
 my @TARGET_COLS = qw(target_3m target_5m target_10m target_15m);
@@ -105,14 +117,46 @@ sub dist_cols_from_header {
 #    0 si no) y rellenar el valor con 0 SOLO despues de fijar el flag -- para
 #    que el modelo distinga "distancia 0 real" de "no habia zona" (mismo
 #    principio que preprocess.py aplica al otro dataset).
+#
+#    NORMALIZACION POR ATR (Fase 3 del plan de mejora): las distancias del PDF
+#    vienen en PIP absolutos, y en PIP no significan lo mismo en un dia
+#    tranquilo que en uno agitado -- por eso, medidas con ridge sobre
+#    train=abril-junio / test=julio, EMPEORABAN el MAE respecto a predecir la
+#    media (-0.7% en target_15m). Dividiendolas por el ATR de 1m de su propia
+#    fila pasan a aportar (+1.1%), y combinadas con las features de estado del
+#    fantasma llevan target_15m a +3.4%.
+#
+#    Se hace aqui y NO en el extractor a proposito: el CSV conserva las
+#    columnas en PIP que el PDF exige (es la tabla de features que se
+#    presenta), y anadir las variantes normalizadas COMO COLUMNAS NUEVAS
+#    duplicaria ~69 features perfectamente colineales, diluyendo la senal.
 # =============================================================================
+
+# is_atr_scaled: que columnas se dividen por el ATR. Son las distancias y
+# espesores del PDF: dist_daily/dist_4h/dist_weekly y todo el bloque por
+# temporalidad (tf1m_/tf10m_/tf1h_, que incluye dist_*, thick_* y
+# vwap_band1_width). Las columnas de estado del fantasma y de volatilidad que
+# anadio la Fase 2 NO entran: las que lo necesitan ya traen su propia variante
+# _atr calculada en el extractor (ghost_wick_atr, rng15_atr, ...).
+sub is_atr_scaled { return $_[0] =~ /^(?:dist_|tf)/ ? 1 : 0; }
+
 sub impute_rows {
     my ($rows, $dist_cols) = @_;
     for my $row (@$rows) {
+        # ATR de 1m de ESTA fila, expresado en PIP para que el cociente sea
+        # "cuantos ATR es esta distancia" (la columna atr_1m viene en unidades
+        # de precio; el factor 1/PIP_SIZE es constante y la estandarizacion
+        # posterior lo absorberia igual, se hace explicito por claridad).
+        my $atr_pip = ( defined($row->{atr_1m}) && $row->{atr_1m} ne ''
+                        && $row->{atr_1m} > 0 )
+            ? $row->{atr_1m} / PIP_SIZE : undef;
+
         for my $col (@$dist_cols) {
             my $has = ( defined($row->{$col}) && $row->{$col} ne '' ) ? 1 : 0;
             $row->{"has_$col"} = $has;
             $row->{$col} = $has ? $row->{$col} + 0 : 0;
+            $row->{$col} /= $atr_pip
+                if $has && defined($atr_pip) && is_atr_scaled($col);
         }
         for my $col (@ALWAYS_COLS) {
             $row->{$col} = ( defined($row->{$col}) && $row->{$col} ne '' ) ? $row->{$col} + 0 : 0;
@@ -161,11 +205,11 @@ sub standardize_rows {
 }
 
 sub save_norm_params {
-    my ($path, $feature_cols, $mean, $std, $target_mean) = @_;
+    my ($path, $feature_cols, $mean, $std, $target_mean, $target_std) = @_;
     open my $fh, '>', $path or die "No pude escribir '$path': $!\n";
     print $fh JSON::PP->new->canonical->pretty->encode({
         feature_cols => $feature_cols, mean => $mean, std => $std,
-        target_mean => $target_mean,
+        target_mean => $target_mean, target_std => $target_std,
     });
     close $fh;
 }
@@ -176,7 +220,8 @@ sub load_norm_params {
     local $/;
     my $data = JSON::PP->new->decode(<$fh>);
     close $fh;
-    return ($data->{feature_cols}, $data->{mean}, $data->{std}, $data->{target_mean});
+    return ($data->{feature_cols}, $data->{mean}, $data->{std},
+            $data->{target_mean}, $data->{target_std});
 }
 
 # =============================================================================
@@ -267,18 +312,29 @@ if ($mode eq 'train') {
 
     my ($mean, $std) = compute_norm_params(\@train_rows, $feature_cols);
 
-    # Baseline ingenuo (para contextualizar el MAE/RMSE del LSTM en 'eval'):
-    # promedio de cada target, calculado SOLO con train -- mismo principio
-    # que la estandarizacion de features, sin fuga de test.
-    my %target_mean;
-    for my $col (@TARGET_COLS) {
-        my $sum = 0; $sum += $_->{$col} for @train_rows;
-        $target_mean{$col} = $sum / scalar(@train_rows);
-    }
+    # Media/desviacion de cada TARGET, calculadas SOLO con train (mismo
+    # principio que la estandarizacion de features, sin fuga de test). Cumplen
+    # DOS papeles:
+    #
+    #   1) Baseline ingenuo para contextualizar el MAE/RMSE en 'eval'
+    #      (predecir siempre la media) -- ya estaba antes.
+    #
+    #   2) ESTANDARIZAR LOS TARGETS para entrenar (Fase 4 del plan de mejora).
+    #      Sin esto, L2Loss multi-salida reparte el gradiente en proporcion a
+    #      la varianza de cada target -- medidas en train: 1.02 / 1.94 / 4.41 /
+    #      7.03 -- asi que target_15m pesaba ~7x mas que target_3m siendo el
+    #      MENOS predecible de los cuatro (R2 alcanzable 0.05 vs 0.13). Con los
+    #      4 targets estandarizados, los 4 pesan igual en la loss.
+    #
+    # Consecuencia util: como la media que estandariza ES la del baseline, una
+    # prediccion estandarizada de 0 equivale exactamente al baseline ingenuo.
+    my ($target_mean, $target_std) = compute_norm_params(\@train_rows, \@TARGET_COLS);
 
-    save_norm_params(NORM_FILE, $feature_cols, $mean, $std, \%target_mean);
+    save_norm_params(NORM_FILE, $feature_cols, $mean, $std, $target_mean, $target_std);
     standardize_rows(\@train_rows, $feature_cols, $mean, $std);
     standardize_rows(\@val_rows,   $feature_cols, $mean, $std);
+    standardize_rows(\@train_rows, \@TARGET_COLS, $target_mean, $target_std);
+    standardize_rows(\@val_rows,   \@TARGET_COLS, $target_mean, $target_std);
     print "Parametros de normalizacion guardados en ", NORM_FILE, "\n";
 
     my ($X_train, $Y_train) = make_sequences(\@train_rows, $feature_cols, SEQ_LEN);
@@ -366,8 +422,11 @@ if ($mode eq 'eval') {
     my $dist_cols = dist_cols_from_header($header);
     impute_rows($rows, $dist_cols);
 
-    my ($feature_cols, $mean, $std, $target_mean) = load_norm_params(NORM_FILE);
+    my ($feature_cols, $mean, $std, $target_mean, $target_std) = load_norm_params(NORM_FILE);
     standardize_rows($rows, $feature_cols, $mean, $std);
+    # OJO: los targets de test se dejan en unidades ORIGINALES (cantidad de
+    # rastros). Lo que se des-estandariza es la SALIDA del modelo, para que
+    # MAE/RMSE y el CSV de predicciones esten en rastros y no en sigmas.
 
     my ($X_test, $Y_test) = make_sequences($rows, $feature_cols, SEQ_LEN);
     printf "Secuencias de test: %d (seq_len=%d)\n", scalar(@$X_test), SEQ_LEN;
@@ -377,39 +436,60 @@ if ($mode eq 'eval') {
 
     my $X_test_nd = $ND->array($X_test);
     my $pred_nd   = $net->($X_test_nd);
-    my $pred      = $pred_nd->aspdl->unpdl;   # -> arrayref de arrayrefs [n][4]
+    my $pred      = $pred_nd->aspdl->unpdl;   # [n][4], EN UNIDADES ESTANDARIZADAS
 
     open my $out, '>', PRED_FILE or die "No pude escribir '", PRED_FILE, "': $!\n";
-    print $out join(',', qw(ts timestamp), (map { "pred_$_" } @TARGET_COLS), @TARGET_COLS), "\n";
+    print $out join(',', qw(ts timestamp),
+        (map { "pred_$_"    } @TARGET_COLS),   # salida continua, en rastros
+        (map { "predint_$_" } @TARGET_COLS),   # recortada a >=0 y redondeada
+        @TARGET_COLS), "\n";                   # etiquetado automatico
 
-    my (@pred_by_target, @actual_by_target);
+    my (@pred_by_target, @int_by_target, @actual_by_target);
     for my $i (0 .. $#$X_test) {
         # la fila "objetivo" de la secuencia $i es rows[$i + SEQ_LEN - 1]
         my $row = $rows->[ $i + SEQ_LEN - 1 ];
-        my @p = @{ $pred->[$i] };
         my @a = @{ $Y_test->[$i] };
-        print $out join(',', $row->{ts}, $row->{timestamp}, @p, @a), "\n";
+        my (@p, @pi);
         for my $k (0 .. $#TARGET_COLS) {
-            push @{ $pred_by_target[$k] },   $p[$k];
+            my $col = $TARGET_COLS[$k];
+            # Des-estandarizar: la red predice sigmas, aqui se vuelve a
+            # "cantidad de rastros" con la media/std de train guardadas.
+            my $v = $pred->[$i][$k] * $target_std->{$col} + $target_mean->{$col};
+            push @p, $v;
+            # Version de CONTEO: los rastros son enteros no negativos, asi que
+            # recortar a >=0 y redondear es informacion de dominio gratis.
+            # Medido (Fase 2 del plan): mejora el MAE ~1-2 pp, pero EMPEORA el
+            # error cuadratico en el horizonte corto (R2 de target_3m 0.132 ->
+            # 0.005), porque redondear mueve muchas predicciones medias justo
+            # al otro lado del entero. Por eso se reportan y guardan LAS DOS y
+            # no se sustituye una por otra.
+            my $vi = $v < 0 ? 0 : int($v + 0.5);
+            push @pi, $vi;
+            push @{ $pred_by_target[$k] },   $v;
+            push @{ $int_by_target[$k] },    $vi;
             push @{ $actual_by_target[$k] }, $a[$k];
         }
+        print $out join(',', $row->{ts}, $row->{timestamp}, @p, @pi, @a), "\n";
     }
     close $out;
 
     print "\n=== Comparacion vs etiquetado automatico (target_*) ===\n";
-    printf "  %-12s %-22s %-22s\n", '', 'LSTM', 'Baseline (promedio train)';
+    printf "  %-12s %-24s %-24s %-24s\n", '',
+        'LSTM (continuo)', 'LSTM (entero >=0)', 'Baseline (promedio train)';
     for my $k (0 .. $#TARGET_COLS) {
         my $col = $TARGET_COLS[$k];
-        my ($mae, $rmse) = mae_rmse($pred_by_target[$k], $actual_by_target[$k]);
+        my ($mae,  $rmse)  = mae_rmse($pred_by_target[$k], $actual_by_target[$k]);
+        my ($imae, $irmse) = mae_rmse($int_by_target[$k],  $actual_by_target[$k]);
 
         # Baseline: predecir SIEMPRE el promedio de train para ese target.
         my $bmean = $target_mean->{$col};
         my @baseline_pred = ($bmean) x scalar(@{ $actual_by_target[$k] });
         my ($bmae, $brmse) = mae_rmse(\@baseline_pred, $actual_by_target[$k]);
 
-        my $improvement = ($bmae > 0) ? (1 - $mae/$bmae) * 100 : 0;
-        printf "  %-12s MAE=%.3f RMSE=%.3f     MAE=%.3f RMSE=%.3f     (LSTM mejora %.1f%%)\n",
-            $col, $mae, $rmse, $bmae, $brmse, $improvement;
+        my $imp  = ($bmae > 0) ? (1 - $mae  / $bmae) * 100 : 0;
+        my $iimp = ($bmae > 0) ? (1 - $imae / $bmae) * 100 : 0;
+        printf "  %-12s MAE=%.3f RMSE=%.3f      MAE=%.3f RMSE=%.3f      MAE=%.3f RMSE=%.3f      (mejora: continuo %.1f%%, entero %.1f%%)\n",
+            $col, $mae, $rmse, $imae, $irmse, $bmae, $brmse, $imp, $iimp;
     }
 
     print "\nPredicciones guardadas en ", PRED_FILE, "\n";
