@@ -19,7 +19,7 @@
 | 2 | Nuevas columnas en `ghost_dataset.pl` (+ regenerar CSV) | ✅ Completada |
 | 3 | Normalizar distancias por ATR en el entrenamiento | ✅ Completada |
 | 4 | Loss y salida correctas para conteos | ✅ Completada |
-| 5 | Re-sintonizar la regularización | 🔄 En curso (hipótesis refutada, verificando) |
+| 5 | Re-sintonizar la regularización | ✅ Cerrada — hipótesis refutada, sin cambios |
 | 6 | Métricas defendibles para la exposición | ⬜ Pendiente |
 
 ---
@@ -463,8 +463,8 @@ depende de si al presentar se penaliza el error medio o el error grande.
 
 ## FASE 5 — Re-sintonizar la regularización
 
-**Estado:** ⬜ Pendiente
-**Archivo:** `train_lstm_ghosts.pl`, constantes del bloque `use constant`
+**Estado:** ✅ Cerrada (2026-07-26) — **hipótesis refutada, sin cambios de código**
+**Archivo:** `train_lstm_ghosts.pl` — se verificó y se dejó **como estaba**
 
 ### Cambios
 
@@ -480,7 +480,77 @@ Barrido corto eligiendo por `val_loss` con el early stopping que ya existe:
 
 ### Log
 
-_(pendiente)_
+> **RESULTADO: hipótesis REFUTADA. Fase cerrada SIN cambios de código.**
+> La regularización actual (`hidden=16`, `dropout=0.5`, `wd=0.01`) ya está en el
+> óptimo. El razonamiento del plan —"se eligió para combatir ruido, con señal
+> real hará falta menos"— era **incorrecto**.
+
+#### Vuelta 1: 12 configuraciones con regularización más débil
+
+`hidden` ∈ {16,32,64} × `dropout` ∈ {0.1,0.2} × `wd` ∈ {1e-4,1e-3}.
+
+| | val_loss |
+|---|---|
+| Configuración actual (`h16 d0.5 wd0.01`) | **0.5203** |
+| Mejor de las 12 (`h16 d0.2 wd1e-4`) | 0.5592 |
+| Peor de las 12 (`h64 d0.1 wd1e-4`) | 0.5762 |
+
+**Ninguna de las 12 se acercó.** El eval de la ganadora en julio confirma:
++4.8 / +2.3 / +2.2 / +1.4 %, muy por debajo del +5.0 / +6.6 / +4.4 / +3.4 % de
+la configuración actual.
+
+#### Vuelta 2: descartar ruido y explorar hacia regularización más fuerte
+
+Antes de aceptar la conclusión había que descartar dos explicaciones
+alternativas.
+
+**(1) ¿Es ruido de inicialización?** Tres repeticiones de la configuración
+actual: `0.5234 / 0.5228 / 0.5220` → media **0.5227**, rango **0.0014**. El
+ruido entre corridas es ~0.002; la brecha contra la vuelta 1 es ~0.04, o sea
+**más de 20× el ruido**. La diferencia es real.
+
+> Nota honesta: la corrida original de la Fase 4 dio 0.5203, *fuera* del rango
+> de las 3 repeticiones (0.5220-0.5234). Fue una tirada afortunada. Con 3
+> muestras el rango subestima la dispersión real, que está más cerca de ±0.003.
+> Cualquier diferencia menor que eso entre configuraciones **no significa nada**.
+
+**(2) ¿Está el óptimo en regularización aún más fuerte, o en otra parte?**
+
+| Configuración | val_loss | ¿distinguible del actual? |
+|---|---|---|
+| `h16 d0.4 wd0.01` | 0.5206 | no (dentro del ruido) |
+| `h8  d0.5 wd0.01` | 0.5208 | no |
+| `h16 d0.5 wd0.01` (actual, media de 3) | 0.5227 | — |
+| `h16 d0.3 wd0.01` | 0.5231 | no |
+| `h32 d0.5 wd0.01` | 0.5233 | no |
+| `h16 d0.6 wd0.01` | 0.5238 | no |
+| `h16 d0.5 wd0.003` | 0.5303 | **sí, peor** |
+| `h16 d0.5 wd0.03` | 0.5321 | **sí, peor** |
+
+#### Qué se aprendió (esto sí importa para la exposición)
+
+- **El `weight_decay` es el hiperparámetro que manda, no el dropout.** Con
+  `wd=0.01` fijo, mover el dropout entre 0.3 y 0.6 no cambia nada
+  (0.5206-0.5238, todo dentro del ruido). Pero mover el `wd` a 0.003 o a 0.03
+  empeora claramente. El mal resultado de la vuelta 1 lo causó el `wd` débil
+  (1e-4/1e-3), no el dropout bajo.
+- **La capacidad no es la restricción activa.** `hidden` 8 / 16 / 32 dan
+  prácticamente lo mismo (0.5208 / 0.5227 / 0.5233). Coherente con el
+  diagnóstico de la Fase 0: la señal disponible es pequeña y casi toda lineal,
+  así que más neuronas no tienen nada que capturar.
+- **No se cambia nada por perseguir ruido.** `h16 d0.4 wd0.01` es nominalmente
+  la #1 (0.5206), pero está dentro del ruido de inicialización y su eval en
+  julio es indistinguible del actual (+4.7 / +6.4 / +4.3 / +3.4 vs
+  +5.0 / +6.6 / +4.4 / +3.4). Cambiar los hiperparámetros para adoptarla sería
+  sobreajustar a la partición de validación.
+
+#### Advertencia metodológica
+
+El barrido selecciona por `val_loss` sobre el último 10% de train (finales de
+junio), **nunca** sobre julio. Es lo correcto —julio es el test y no debe influir
+en la selección— pero implica que la configuración elegida por validación no
+tiene por qué ser la mejor en julio. Los números de julio de esta sección se
+reportan como *verificación a posteriori*, no como criterio de elección.
 
 ---
 
